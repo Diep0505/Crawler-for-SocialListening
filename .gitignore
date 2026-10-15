@@ -20,8 +20,7 @@ __pycache__/
 htmlcov/
 
 # 3. Browser Profiles, Sessions & Authentication Data (CRITICAL: Do NOT push to GitHub)
-profiles/*
-!profiles/.gitkeep
+profiles/
 playwright/.auth/
 *.session
 *.session-journal
