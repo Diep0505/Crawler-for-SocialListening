@@ -206,103 +206,117 @@ def main():
     debug_file = OUTPUT_DIR / f"facebook_posts_auto_debug_{stamp}.json"
     dataset_records = []
     debug_records = []
-    context = None
+    author_followers_cache = {}
+
     try:
-        print("Launching CloakBrowser...", flush=True)
-        context = launch_persistent_context(
-            str(PROFILE_DIR),
-            headless=False,
-            args=[f"--fingerprint={FINGERPRINT_SEED}"],
-            viewport={"width": 1280, "height": 900},
-        )
-        page = context.new_page()
-        for post in POSTS:
-            print(f"Reading {post['sample_id']}: {post['url']}", flush=True)
-            debug_record = {
-                "sample_id": post["sample_id"],
-                "requested_url": post["url"],
-                "post_url": None,
-                "candidate_text": None,
-                "collection_status": "failed",
-                "text_status": "unverified",
-                "locator_details": [],
-                "expansion_actions": [],
-                "review_reasons": [],
-                "error": None,
-            }
-            clean_record = None
-            stop_for_login = False
-            try:
-                page.goto(post["url"], wait_until="domcontentloaded", timeout=60000)
-                wait_for_anchor(page, post["anchors"])
-                debug_record["expansion_actions"] = expand_known_post(page, post["anchors"])
-                candidate, details = wait_for_stable_candidates(page, post["anchors"])
-                debug_record["candidate_text"] = candidate or None
-                debug_record["locator_details"] = details
+        print("Launching CloakBrowser with managed session...", flush=True)
+        with fd.PersistentBrowserSession(PROFILE_DIR, fingerprint=FINGERPRINT_SEED, headless=False) as context:
+            page = context.new_page()
+            for post in POSTS:
+                print(f"\nReading {post['sample_id']}: {post['url']}", flush=True)
+                debug_record = {
+                    "sample_id": post["sample_id"],
+                    "requested_url": post["url"],
+                    "post_url": None,
+                    "candidate_text": None,
+                    "collection_status": "failed",
+                    "text_status": "unverified",
+                    "locator_details": [],
+                    "expansion_actions": [],
+                    "review_reasons": [],
+                    "error": None,
+                }
+                clean_record = None
+                stop_for_login = False
+                try:
+                    page.goto(post["url"], wait_until="domcontentloaded", timeout=60000)
 
-                # Scoped interaction and media metrics extraction
-                metrics = fd.extract_page_metrics(page, anchors=post.get("anchors"))
+                    # Dynamic anchor discovery if no anchors pre-configured
+                    anchors = post.get("anchors") or []
+                    if not anchors:
+                        page.wait_for_timeout(2000)
+                        anchors = fd.auto_discover_anchors(page)
+                        print(f"Auto-discovered anchors from page: {anchors}", flush=True)
 
-                extracted_text = None
-                if candidate:
-                    reasons = debug_record["review_reasons"]
-                    if any(d["status"] != "matched" for d in details):
-                        reasons.append("Some anchors were not found or returned multiple matches.")
-                    if has_more_label(candidate):
-                        reasons.append("Post content may not be fully expanded.")
-                    if any(a["status"] != "clicked_more" for a in debug_record["expansion_actions"]):
-                        reasons.append("Could not reliably identify or click 'See more' button.")
-                    if reasons:
-                        debug_record["text_status"] = "needs_review"
-                        debug_record["collection_status"] = "needs_review"
+                    if anchors:
+                        wait_for_anchor(page, anchors)
+                        debug_record["expansion_actions"] = expand_known_post(page, anchors)
+                        candidate, details = wait_for_stable_candidates(page, anchors)
                     else:
-                        extracted_text = candidate
-                        debug_record["text_status"] = "extracted_unverified"
-                        debug_record["collection_status"] = "extracted_text_only"
-                    print(f"Extracted {len(candidate)} characters; status: {debug_record['text_status']}", flush=True)
-                else:
-                    debug_record["error"] = "No unique content matched for anchors."
+                        candidate, details = "", []
 
-                # Build clean 17-column record
-                clean_record = fd.build_dataset_record(
-                    post_url=page.url,
-                    text=extracted_text,
-                    published_at=metrics.get("published_at"),
-                    author_id=fd.extract_author_id(page.url),
-                    post_id=fd.extract_post_id(page.url),
-                    sport_category=post.get("sport_category"),
-                    like_count=metrics.get("like_count_raw"),
-                    comment_count=metrics.get("comment_count_raw"),
-                    share_count=metrics.get("share_count_raw"),
-                    view_count=metrics.get("view_count_raw"),
-                    media_type=metrics.get("media_type", "text"),
-                    author_followers=metrics.get("author_followers_raw"),
-                )
+                    debug_record["candidate_text"] = candidate or None
+                    debug_record["locator_details"] = details
 
-            except (Error, ValueError) as exc:
-                debug_record["error"] = str(exc)
-                stop_for_login = access_issue(page) is not None
-                print(f"Error: {exc}", flush=True)
-                clean_record = fd.build_dataset_record(
-                    post_url=page.url if "page" in locals() else post["url"],
-                    text=None,
-                    sport_category=post.get("sport_category"),
-                )
+                    # Scoped interaction and media metrics extraction
+                    metrics = fd.extract_page_metrics(page, anchors=anchors)
 
-            debug_record["post_url"] = page.url
-            if debug_record["collection_status"] in ("failed", "needs_review"):
-                save_review_screenshot(page, debug_file, post["sample_id"], debug_record)
+                    extracted_text = None
+                    if candidate:
+                        reasons = debug_record["review_reasons"]
+                        if any(d["status"] != "matched" for d in details):
+                            reasons.append("Some anchors were not found or returned multiple matches.")
+                        if has_more_label(candidate):
+                            reasons.append("Post content may not be fully expanded.")
+                        if any(a["status"] != "clicked_more" for a in debug_record["expansion_actions"]):
+                            reasons.append("Could not reliably identify or click 'See more' button.")
+                        if reasons:
+                            debug_record["text_status"] = "needs_review"
+                            debug_record["collection_status"] = "needs_review"
+                        else:
+                            extracted_text = candidate
+                            debug_record["text_status"] = "extracted_unverified"
+                            debug_record["collection_status"] = "extracted_text_only"
+                        print(f"Extracted {len(candidate)} characters; status: {debug_record['text_status']}", flush=True)
+                    else:
+                        debug_record["error"] = "No unique content matched for anchors."
 
-            debug_records.append(debug_record)
-            dataset_records.append(clean_record)
+                    # Extract author ID & resolve follower count via profile
+                    author_id = fd.extract_author_id(page.url)
+                    author_followers = fd.fetch_author_followers(context, author_id, cache=author_followers_cache)
+                    if author_followers is not None:
+                        print(f"Author {author_id} followers: {author_followers:,}", flush=True)
 
-            save_records(dataset_file, dataset_records)
-            save_records(debug_file, debug_records)
+                    # Build clean 17-column record
+                    clean_record = fd.build_dataset_record(
+                        post_url=page.url,
+                        text=extracted_text,
+                        published_at=metrics.get("published_at"),
+                        author_id=author_id,
+                        post_id=fd.extract_post_id(page.url),
+                        sport_category=post.get("sport_category"),
+                        like_count=metrics.get("like_count_raw"),
+                        comment_count=metrics.get("comment_count_raw"),
+                        share_count=metrics.get("share_count_raw"),
+                        view_count=metrics.get("view_count_raw"),
+                        media_type=metrics.get("media_type", "text"),
+                        author_followers=author_followers,
+                    )
 
-            if stop_for_login:
-                print("Stopping: login/verification required in login profile.")
-                break
-        print(f"Saved standard dataset (17 columns): {dataset_file}")
+                except (Error, ValueError) as exc:
+                    debug_record["error"] = str(exc)
+                    stop_for_login = access_issue(page) is not None
+                    print(f"Error: {exc}", flush=True)
+                    clean_record = fd.build_dataset_record(
+                        post_url=page.url if "page" in locals() else post["url"],
+                        text=None,
+                        sport_category=post.get("sport_category"),
+                    )
+
+                debug_record["post_url"] = page.url
+                if debug_record["collection_status"] in ("failed", "needs_review"):
+                    save_review_screenshot(page, debug_file, post["sample_id"], debug_record)
+
+                debug_records.append(debug_record)
+                dataset_records.append(clean_record)
+
+                save_records(dataset_file, dataset_records)
+                save_records(debug_file, debug_records)
+
+                if stop_for_login:
+                    print("Stopping: login/verification required in login profile.")
+                    break
+        print(f"\nSaved standard dataset (17 columns): {dataset_file}")
         print(f"Saved technical debug log: {debug_file}")
         return 0 if dataset_records and all(r["text"] is not None for r in dataset_records) else 1
     except (Error, OSError, ValueError) as exc:
@@ -311,9 +325,6 @@ def main():
     except KeyboardInterrupt:
         print("\nInterrupted by user. Completed posts were preserved.")
         return 130
-    finally:
-        if context is not None:
-            context.close()
 
 
 if __name__ == "__main__":

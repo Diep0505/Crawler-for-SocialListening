@@ -21,6 +21,7 @@ Specification source: sources/dataset_requirements.xlsx
 17. sport_category
 """
 
+import atexit
 import json
 import re
 from datetime import datetime, timezone
@@ -616,3 +617,117 @@ def convert_legacy_file(input_path, output_path=None):
     out_file = Path(output_path) if output_path else in_file.with_name(f"{in_file.stem}_17cols.json")
     out_file.write_text(json.dumps(converted, ensure_ascii=False, indent=2), encoding="utf-8")
     return out_file
+
+
+def clean_profile_locks(profile_dir):
+    """Removes stale Chromium singleton lock files left behind by interrupted sessions."""
+    p = Path(profile_dir)
+    if not p.is_dir():
+        return
+    for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        lock_file = p / lock_name
+        try:
+            if lock_file.is_symlink() or lock_file.exists():
+                lock_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def auto_discover_anchors(page):
+    """Automatically derives clean text anchor keywords from page title for anchor-free scraping."""
+    try:
+        title = page.title()
+        if not title:
+            return []
+        # Title format on permalinks: "Author - Snippet... | Facebook" or "Snippet | Facebook"
+        clean = re.sub(r"\s*\|\s*Facebook.*$", "", title, flags=re.IGNORECASE).strip()
+        if " - " in clean:
+            parts = clean.split(" - ", 1)
+            raw_snippet = parts[1].strip()
+        else:
+            raw_snippet = clean
+
+        raw_snippet = re.sub(r"\.{2,}", "", raw_snippet).strip()
+        anchors = []
+        if raw_snippet:
+            anchors.append(raw_snippet[:40].strip())
+        clean_words = re.findall(r"[\w\u00C0-\u1EF9\uD835\uDC00-\uD835\uDC33]{3,}", raw_snippet)
+        if clean_words:
+            anchors.append(" ".join(clean_words[:4]))
+        return [a for a in dict.fromkeys(anchors) if a]
+    except Exception:
+        return []
+
+
+def fetch_author_followers(context, author_id, cache=None, timeout_ms=30000):
+    """Resolves author's follower count into an integer by visiting their profile page.
+    Results are cached in the provided dict to avoid duplicate visits.
+    """
+    if not author_id or author_id.lower() in ("profile.php", "story.php", "permalink.php"):
+        return None
+    if cache is not None and author_id in cache:
+        return cache[author_id]
+
+    followers_int = None
+    page = None
+    try:
+        page = context.new_page()
+        page.goto(f"https://www.facebook.com/{author_id}", wait_until="domcontentloaded", timeout=timeout_ms)
+        page.wait_for_timeout(2500)
+        raw_count = page.evaluate(r'''() => {
+            const m = (document.body.innerText || "").match(/([\d.,]+[KkMmB]?|\d+)\s*(?:followers|người theo dõi)/i);
+            return m ? m[1] : null;
+        }''')
+        followers_int = parse_numeric_count(raw_count)
+    except Exception:
+        followers_int = None
+    finally:
+        if page is not None:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+    if cache is not None:
+        cache[author_id] = followers_int
+    return followers_int
+
+
+class PersistentBrowserSession:
+    """Context manager for CloakBrowser with automatic cleanup, atexit hook, and stale lock clearing."""
+
+    def __init__(self, profile_dir, fingerprint=12345, headless=False, viewport=None):
+        self.profile_dir = Path(profile_dir)
+        self.fingerprint = fingerprint
+        self.headless = headless
+        self.viewport = viewport or {"width": 1280, "height": 900}
+        self.context = None
+        self._cleaned_up = False
+
+    def __enter__(self):
+        clean_profile_locks(self.profile_dir)
+        from cloakbrowser import launch_persistent_context
+        self.context = launch_persistent_context(
+            str(self.profile_dir),
+            headless=self.headless,
+            args=[f"--fingerprint={self.fingerprint}"],
+            viewport=self.viewport,
+        )
+        atexit.register(self.close)
+        return self.context
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    def close(self):
+        if not self._cleaned_up:
+            self._cleaned_up = True
+            if self.context is not None:
+                try:
+                    self.context.close()
+                except Exception:
+                    pass
+                self.context = None
+            clean_profile_locks(self.profile_dir)
+

@@ -109,111 +109,109 @@ def main():
     debug_file = OUTPUT_DIR / f"facebook_posts_debug_{run_stamp}.json"
     dataset_records = []
     debug_records = []
+    author_followers_cache = {}
 
-    context = None
     try:
-        print(f"Launching CloakBrowser with profile: {PROFILE_DIR}", flush=True)
-        context = launch_persistent_context(
-            str(PROFILE_DIR),
-            headless=False,
-            args=[f"--fingerprint={FINGERPRINT_SEED}"],
-            viewport={"width": 1280, "height": 900},
-        )
-        page = context.new_page()
+        print(f"Launching CloakBrowser with managed profile: {PROFILE_DIR}", flush=True)
+        with fd.PersistentBrowserSession(PROFILE_DIR, fingerprint=FINGERPRINT_SEED, headless=False) as context:
+            page = context.new_page()
 
-        for post in POSTS:
-            print(f"\n--- {post['sample_id']} ---")
-            debug_record = {
-                "sample_id": post["sample_id"],
-                "requested_url": post["url"],
-                "post_url": None,
-                "candidate_text": None,
-                "collection_status": "failed",
-                "text_status": "unverified",
-                "locator_details": [],
-                "error": None,
-            }
-            clean_record = None
-            try:
-                page.goto(
-                    post["url"],
-                    wait_until="domcontentloaded",
-                    timeout=60000,
-                )
-                print("If prompted, log in or solve verification manually in this tab.")
-                print("Expand 'See more' if needed; wait for full content to load.")
-                print("Keep the target post active in this browser tab.")
-                input("Return to terminal and press Enter to read post...")
+            for post in POSTS:
+                print(f"\n--- {post['sample_id']} ---")
+                debug_record = {
+                    "sample_id": post["sample_id"],
+                    "requested_url": post["url"],
+                    "post_url": None,
+                    "candidate_text": None,
+                    "collection_status": "failed",
+                    "text_status": "unverified",
+                    "locator_details": [],
+                    "error": None,
+                }
+                clean_record = None
+                try:
+                    page.goto(
+                        post["url"],
+                        wait_until="domcontentloaded",
+                        timeout=60000,
+                    )
+                    print("If prompted, log in or solve verification manually in this tab.")
+                    print("Expand 'See more' if needed; wait for full content to load.")
+                    print("Keep the target post active in this browser tab.")
+                    input("Return to terminal and press Enter to read post...")
 
-                candidate, details = read_candidates(page, post["anchors"])
-                debug_record["post_url"] = page.url
-                debug_record["candidate_text"] = candidate or None
-                debug_record["locator_details"] = details
+                    candidate, details = read_candidates(page, post["anchors"])
+                    debug_record["post_url"] = page.url
+                    debug_record["candidate_text"] = candidate or None
+                    debug_record["locator_details"] = details
 
-                # Extract interaction metrics and media type scoped to the post
-                metrics = fd.extract_page_metrics(page, anchors=post.get("anchors"))
+                    # Extract interaction metrics and media type scoped to the post
+                    metrics = fd.extract_page_metrics(page, anchors=post.get("anchors"))
 
-                confirmed_text = None
-                if candidate:
-                    print(f"\nEXTRACTED TEXT:\n{candidate}\n")
-                    answer = input(
-                        "Verify on Facebook: Is this the FULL post text "
-                        "without menus/comments? Enter y if confirmed: "
-                    ).strip().lower()
-                    if answer == "y":
-                        confirmed_text = candidate
-                        debug_record["text_status"] = "user_confirmed"
-                        debug_record["collection_status"] = "ok_text_only"
+                    confirmed_text = None
+                    if candidate:
+                        print(f"\nEXTRACTED TEXT:\n{candidate}\n")
+                        answer = input(
+                            "Verify on Facebook: Is this the FULL post text "
+                            "without menus/comments? Enter y if confirmed: "
+                        ).strip().lower()
+                        if answer == "y":
+                            confirmed_text = candidate
+                            debug_record["text_status"] = "user_confirmed"
+                            debug_record["collection_status"] = "ok_text_only"
+                        else:
+                            debug_record["text_status"] = "needs_review"
+                            debug_record["collection_status"] = "needs_review"
                     else:
-                        debug_record["text_status"] = "needs_review"
-                        debug_record["collection_status"] = "needs_review"
-                else:
-                    debug_record["error"] = "No unique content matched for given anchors."
+                        debug_record["error"] = "No unique content matched for given anchors."
 
-                # Build clean 17-column record
-                clean_record = fd.build_dataset_record(
-                    post_url=page.url,
-                    text=confirmed_text,
-                    published_at=metrics.get("published_at"),
-                    author_id=fd.extract_author_id(page.url),
-                    post_id=fd.extract_post_id(page.url),
-                    sport_category=post.get("sport_category"),
-                    like_count=metrics.get("like_count_raw"),
-                    comment_count=metrics.get("comment_count_raw"),
-                    share_count=metrics.get("share_count_raw"),
-                    view_count=metrics.get("view_count_raw"),
-                    media_type=metrics.get("media_type", "text"),
-                    author_followers=metrics.get("author_followers_raw"),
+                    # Resolve author followers via profile
+                    author_id = fd.extract_author_id(page.url)
+                    author_followers = fd.fetch_author_followers(context, author_id, cache=author_followers_cache)
+
+                    # Build clean 17-column record
+                    clean_record = fd.build_dataset_record(
+                        post_url=page.url,
+                        text=confirmed_text,
+                        published_at=metrics.get("published_at"),
+                        author_id=author_id,
+                        post_id=fd.extract_post_id(page.url),
+                        sport_category=post.get("sport_category"),
+                        like_count=metrics.get("like_count_raw"),
+                        comment_count=metrics.get("comment_count_raw"),
+                        share_count=metrics.get("share_count_raw"),
+                        view_count=metrics.get("view_count_raw"),
+                        media_type=metrics.get("media_type", "text"),
+                        author_followers=author_followers,
+                    )
+
+                except Error as exc:
+                    debug_record["error"] = str(exc)
+                    print(f"Error reading post: {exc}")
+                    clean_record = fd.build_dataset_record(
+                        post_url=page.url if "page" in locals() else post["url"],
+                        text=None,
+                        sport_category=post.get("sport_category"),
+                    )
+
+                debug_records.append(debug_record)
+                dataset_records.append(clean_record)
+
+                # Persist incrementally after each post
+                dataset_file.write_text(
+                    json.dumps(dataset_records, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
                 )
-
-            except Error as exc:
-                debug_record["error"] = str(exc)
-                print(f"Error reading post: {exc}")
-                clean_record = fd.build_dataset_record(
-                    post_url=page.url if "page" in locals() else post["url"],
-                    text=None,
-                    sport_category=post.get("sport_category"),
+                debug_file.write_text(
+                    json.dumps(debug_records, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
                 )
+                print(f"Saved standard dataset (17 columns): {dataset_file}")
+                print(f"Saved technical debug log: {debug_file}")
 
-            debug_records.append(debug_record)
-            dataset_records.append(clean_record)
-
-            # Persist incrementally after each post
-            dataset_file.write_text(
-                json.dumps(dataset_records, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            debug_file.write_text(
-                json.dumps(debug_records, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            print(f"Saved standard dataset (17 columns): {dataset_file}")
-            print(f"Saved technical debug log: {debug_file}")
-
-        print("\nFinished run.")
-        print(f"Dataset has exactly {len(fd.REQUIRED_COLUMNS)} columns matching specification.")
-        input("Press Enter to close browser...")
-        return 0
+            print("\nFinished run.")
+            print(f"Dataset has exactly {len(fd.REQUIRED_COLUMNS)} columns matching specification.")
+            return 0
 
     except (Error, OSError, ValueError) as exc:
         print(f"Run failed: {exc}")
@@ -221,9 +219,6 @@ def main():
     except KeyboardInterrupt:
         print("\nInterrupted by user. Completed posts were preserved in output.")
         return 130
-    finally:
-        if context is not None:
-            context.close()
 
 
 if __name__ == "__main__":
