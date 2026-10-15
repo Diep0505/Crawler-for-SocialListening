@@ -1,0 +1,64 @@
+# ==========================================
+# Git Ignore Configuration
+# ==========================================
+
+# 1. Virtual Environments & Packages
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# 2. Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 3. Browser Profiles, Sessions & Authentication Data (CRITICAL: Do NOT push to GitHub)
+profiles/*
+!profiles/.gitkeep
+playwright/.auth/
+*.session
+*.session-journal
+
+# 4. Scraper Outputs, Screenshots & Temporary Files
+output/*
+!output/.gitkeep
+*.tmp
+*.log
+screenshot*.png
+
+# 5. Environment Variables & Secret Credentials
+.env
+.env.*
+*.pem
+*.key
+
+# 6. Operating System Artifacts (macOS / Windows / Linux)
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# 7. IDE & Editor Artifacts
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.agents/
+.gemini/
+
+# 8. Playwright Artifacts & Traces
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
