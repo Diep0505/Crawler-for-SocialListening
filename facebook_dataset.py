@@ -23,12 +23,15 @@ Specification source: sources/dataset_requirements.xlsx
 
 import atexit
 import json
+import logging
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
+logger = logging.getLogger("facebook_dataset")
 VIETNAM_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
 # Exact list of 17 required columns in order
@@ -71,9 +74,10 @@ VALID_SPORTS = {
     "Chess",
     "Shooting",
     "Weightlifting",
+    "Cycling",
 }
 
-# Mapping common Vietnamese and English synonyms to canonical English sport names
+# Mapping common Vietnamese, Spanish, and English synonyms to canonical English sport names
 SPORT_SYNONYMS = {
     "bóng đá": "Football",
     "soccer": "Football",
@@ -93,6 +97,12 @@ SPORT_SYNONYMS = {
     "f1": "Motorsport",
     "điền kinh": "Athletics",
     "athletics": "Athletics",
+    "marathon": "Athletics",
+    "maratón": "Athletics",
+    "maratona": "Athletics",
+    "running": "Athletics",
+    "chạy bộ": "Athletics",
+    "atletismo": "Athletics",
     "võ thuật": "Martial Arts",
     "martial arts": "Martial Arts",
     "mma": "Martial Arts",
@@ -113,6 +123,9 @@ SPORT_SYNONYMS = {
     "shooting": "Shooting",
     "cử tạ": "Weightlifting",
     "weightlifting": "Weightlifting",
+    "cycling": "Cycling",
+    "đua xe đạp": "Cycling",
+    "xe đạp": "Cycling",
 }
 
 # Distinct Vietnamese diacritics for language detection
@@ -123,6 +136,25 @@ VIETNAMESE_DISTINCT_RE = re.compile(
 COMMON_VN_WORDS = {
     "và", "của", "là", "có", "được", "trong", "cho", "với",
     "không", "người", "này", "khi", "đã", "sẽ", "về", "như", "bài",
+}
+COMMON_ES_WORDS = {
+    "el", "la", "de", "que", "y", "en", "un", "ser", "se", "no", "por",
+    "con", "su", "para", "como", "estar", "tener", "le", "lo", "pero",
+    "más", "este", "del", "las", "los", "una", "al", "es", "son", "fue",
+    "sus", "así", "hoy", "año", "gran", "sobre", "entre", "también",
+}
+COMMON_EN_WORDS = {
+    "the", "be", "to", "of", "and", "a", "in", "that", "have", "i",
+    "it", "for", "not", "on", "with", "he", "as", "you", "do", "at",
+    "this", "but", "his", "by", "from", "they", "we", "say", "her",
+    "she", "or", "an", "will", "my", "one", "all", "would", "there",
+    "their", "what", "is", "are", "was", "were", "has", "had",
+}
+COMMON_FR_WORDS = {
+    "le", "la", "les", "de", "des", "du", "un", "une", "et", "est",
+    "en", "que", "qui", "dans", "ce", "cette", "pour", "sur", "avec",
+    "nous", "vous", "notre", "votre", "ils", "sont", "au", "aux", "par",
+    "plus", "très", "bien", "faire", "tout", "ses", "son", "sa", "ont",
 }
 
 # Regex to extract hashtags (#word)
@@ -322,15 +354,19 @@ DOM_EXTRACT_JS = r"""(anchorsArg) => {
 };"""
 
 
-def parse_numeric_count(value):
-    """Converts counts like 20K, 1.5M, 20 nghìn, 1,200 into clean Python integers."""
+def parse_numeric_count_with_meta(value):
+    """Converts counts like 20K, 1.5M, 20 nghìn, 1,200 into clean Python integers.
+    Returns (integer_value, is_approximate).
+    """
     if value is None:
-        return None
+        return None, False
     if isinstance(value, (int, float)):
-        return int(value)
+        return int(value), False
     text = str(value).strip().lower()
     if not text or not re.search(r"\d", text):
-        return None
+        return None, False
+
+    is_approximate = bool(re.search(r"[kmb]|nghìn|ngàn|triệu|tr|tỷ|ty", text))
 
     # Replace language-specific suffixes
     text = re.sub(r"\b(nghìn|ngàn)\b", "k", text)
@@ -340,11 +376,11 @@ def parse_numeric_count(value):
 
     match = re.search(r"(\d[\d.,]*)\s*([kmb]?)", text)
     if not match:
-        return None
+        return None, False
     num_str, unit = match.groups()
     num_str = num_str.strip(".,")
     if not num_str or not re.search(r"\d", num_str):
-        return None
+        return None, False
 
     try:
         if unit:
@@ -356,32 +392,133 @@ def parse_numeric_count(value):
                 num *= 1_000_000
             elif unit == "b":
                 num *= 1_000_000_000
-            return int(num)
+            return int(num), True
         else:
             if "," in num_str and "." in num_str:
                 if num_str.rfind(".") > num_str.rfind(","):
                     num_str = num_str.replace(",", "")
                 else:
                     num_str = num_str.replace(".", "").replace(",", ".")
-                return int(float(num_str))
+                return int(float(num_str)), False
             elif "," in num_str:
                 parts = num_str.split(",")
                 if len(parts[-1]) == 3 and all(len(p) <= 3 for p in parts[:-1]):
                     num_str = "".join(parts)
-                    return int(num_str)
+                    return int(num_str), False
                 else:
-                    return int(float(num_str.replace(",", ".")))
+                    return int(float(num_str.replace(",", "."))), False
             elif "." in num_str:
                 parts = num_str.split(".")
                 if len(parts[-1]) == 3 and all(len(p) <= 3 for p in parts[:-1]):
                     num_str = "".join(parts)
-                    return int(num_str)
+                    return int(num_str), False
                 else:
-                    return int(float(num_str))
+                    return int(float(num_str)), False
             else:
-                return int(num_str)
+                return int(num_str), False
     except (ValueError, TypeError):
-        return None
+        return None, False
+
+
+def parse_numeric_count(value):
+    """Converts counts like 20K, 1.5M, 20 nghìn, 1,200 into clean Python integers."""
+    res, _ = parse_numeric_count_with_meta(value)
+    return res
+
+
+def parse_facebook_timestamp(raw, reference_tz=VIETNAM_TZ):
+    """Normalizes Facebook timestamp strings into ISO 8601 with timezone.
+    Returns (iso_string, precision).
+    When there is sufficient evidence (exact day, month, year, hour, minute), returns (iso_str, 'exact').
+    When evidence is incomplete (e.g. '2 h', '3y', 'yesterday'), returns (None, 'insufficient_evidence')
+    to preserve time integrity and avoid fabricating false precision.
+    """
+    if not raw or not isinstance(raw, str):
+        return None, "insufficient_evidence"
+    text = raw.strip()
+    if not text:
+        return None, "insufficient_evidence"
+
+    # If already in valid ISO format
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=reference_tz)
+        return dt.isoformat(), "exact"
+    except Exception:
+        pass
+
+    # Clean leading day of week e.g. "Friday ", "Miércoles, "
+    s_clean = re.sub(
+        r"^(?:[A-Za-zÀ-ÿ]+day|[A-Za-zÀ-ÿ]+es|[A-Za-zÀ-ÿ]+do|[A-Za-zÀ-ÿ]+go|Thứ\s+\w+)[,\s]+",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    months_map = {
+        "jan": 1, "january": 1, "ene": 1, "enero": 1, "tháng 1": 1, "tháng 01": 1,
+        "feb": 2, "february": 2, "febrero": 2, "tháng 2": 2, "tháng 02": 2,
+        "mar": 3, "march": 3, "marzo": 3, "tháng 3": 3, "tháng 03": 3,
+        "apr": 4, "april": 4, "abr": 4, "abril": 4, "tháng 4": 4, "tháng 04": 4,
+        "may": 5, "mayo": 5, "tháng 5": 5, "tháng 05": 5,
+        "jun": 6, "june": 6, "junio": 6, "tháng 6": 6, "tháng 06": 6,
+        "jul": 7, "july": 7, "julio": 7, "tháng 7": 7, "tháng 07": 7,
+        "aug": 8, "august": 8, "ago": 8, "agosto": 8, "tháng 8": 8, "tháng 08": 8,
+        "sep": 9, "september": 9, "set": 9, "septiembre": 9, "tháng 9": 9, "tháng 09": 9,
+        "oct": 10, "october": 10, "octubre": 10, "tháng 10": 10,
+        "nov": 11, "november": 11, "noviembre": 11, "tháng 11": 11,
+        "dec": 12, "december": 12, "dic": 12, "diciembre": 12, "tháng 12": 12,
+    }
+
+    # 1. Pattern: 30 December 2022 at 01:52 or 30 de diciembre de 2022 a las 01:52
+    m1 = re.search(
+        r"(\d{1,2})\s*(?:de\s+)?([A-Za-zÀ-ÿ]+|\d+)\s*(?:de\s+)?(\d{4})\s*(?:at|a las|lúc|,)?\s*(\d{1,2}):(\d{2})(?::(\d{2}))?",
+        s_clean,
+        re.IGNORECASE,
+    )
+    if m1:
+        day = int(m1.group(1))
+        m_str = m1.group(2).lower()
+        year = int(m1.group(3))
+        hour = int(m1.group(4))
+        minute = int(m1.group(5))
+        sec = int(m1.group(6)) if m1.group(6) else 0
+        month = months_map.get(m_str)
+        if month:
+            try:
+                dt = datetime(year, month, day, hour, minute, sec, tzinfo=reference_tz)
+                return dt.isoformat(), "exact"
+            except ValueError:
+                pass
+
+    # 2. Pattern: December 30, 2022 at 1:52 PM
+    m2 = re.search(
+        r"([A-Za-zÀ-ÿ]+)\s+(\d{1,2}),?\s+(\d{4})\s*(?:at|a las|lúc|,)?\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm)?",
+        s_clean,
+        re.IGNORECASE,
+    )
+    if m2:
+        m_str = m2.group(1).lower()
+        day = int(m2.group(2))
+        year = int(m2.group(3))
+        hour = int(m2.group(4))
+        minute = int(m2.group(5))
+        sec = int(m2.group(6)) if m2.group(6) else 0
+        ampm = (m2.group(7) or "").lower()
+        if ampm == "pm" and hour < 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+        month = months_map.get(m_str)
+        if month:
+            try:
+                dt = datetime(year, month, day, hour, minute, sec, tzinfo=reference_tz)
+                return dt.isoformat(), "exact"
+            except ValueError:
+                pass
+
+    return None, "insufficient_evidence"
 
 
 def validate_or_normalize_sport(category):
@@ -477,20 +614,44 @@ def extract_author_id(url, page=None):
 
 
 def detect_language(text):
-    """Detects text language ('vi', 'en', or 'unknown')."""
+    """Detects text language ('vi', 'es', 'en', or 'unknown').
+    Falls back to 'unknown' rather than blindly defaulting Latin to 'en'.
+    """
     if not text:
         return "unknown"
-    words = re.findall(r"\b\w+\b", text.lower())
+    words = [w.lower() for w in re.findall(r"\b\w+\b", text)]
     if not words:
         return "unknown"
+
+    # Vietnamese check
     vn_word_count = sum(1 for w in words if w in COMMON_VN_WORDS)
     if vn_word_count >= 2:
         return "vi"
     vn_chars = len(VIETNAMESE_DISTINCT_RE.findall(text))
     if vn_chars >= 3 and (vn_word_count >= 1 or vn_chars / len(text) > 0.02):
         return "vi"
-    if re.search(r"[A-Za-z]", text):
+
+    # Multi-language scoring: Spanish vs French vs English
+    es_score = sum(1 for w in words if w in COMMON_ES_WORDS)
+    fr_score = sum(1 for w in words if w in COMMON_FR_WORDS)
+    en_score = sum(1 for w in words if w in COMMON_EN_WORDS)
+
+    scores = [("es", es_score), ("fr", fr_score), ("en", en_score)]
+    scores.sort(key=lambda x: x[1], reverse=True)
+    top_lang, top_score = scores[0]
+    second_lang, second_score = scores[1]
+
+    if top_score >= 2 and top_score > second_score:
+        return top_lang
+
+    # Secondary check with accent clues
+    if fr_score >= 1 and re.search(r"[éèêëàâùûçœîï]", text.lower()):
+        return "fr"
+    if es_score >= 1 and re.search(r"[áíóúñ¿¡]", text.lower()):
+        return "es"
+    if en_score >= 2:
         return "en"
+
     return "unknown"
 
 
@@ -620,17 +781,34 @@ def convert_legacy_file(input_path, output_path=None):
 
 
 def clean_profile_locks(profile_dir):
-    """Removes stale Chromium singleton lock files left behind by interrupted sessions."""
+    """Removes stale Chromium singleton lock files left behind by interrupted sessions.
+    Verifies process liveness to NEVER remove locks of an actively running session.
+    """
     p = Path(profile_dir)
     if not p.is_dir():
         return
     for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
         lock_file = p / lock_name
         try:
-            if lock_file.is_symlink() or lock_file.exists():
+            if lock_file.is_symlink():
+                try:
+                    target = os.readlink(lock_file)
+                    pid_match = re.search(r"-(\d+)\Z", target)
+                    if pid_match:
+                        pid = int(pid_match.group(1))
+                        try:
+                            os.kill(pid, 0)
+                            logger.info(f"Preserving active lock {lock_name} held by running PID {pid}")
+                            continue
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
                 lock_file.unlink(missing_ok=True)
-        except OSError:
-            pass
+            elif lock_file.exists():
+                lock_file.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning(f"Failed to unlink lock file {lock_file}: {exc}")
 
 
 def auto_discover_anchors(page):
@@ -639,23 +817,39 @@ def auto_discover_anchors(page):
         title = page.title()
         if not title:
             return []
-        # Title format on permalinks: "Author - Snippet... | Facebook" or "Snippet | Facebook"
-        clean = re.sub(r"\s*\|\s*Facebook.*$", "", title, flags=re.IGNORECASE).strip()
+
+        # 1. Remove notification counts: "(1) ", "(99+) "
+        clean = re.sub(r"^\(\d+\+?\)\s*", "", title).strip()
+        # 2. Remove leading symbols/emojis
+        clean = re.sub(r"^[^\w\s]+", "", clean).strip()
+        # 3. Remove trailing "| Facebook"
+        clean = re.sub(r"\s*\|\s*Facebook.*$", "", clean, flags=re.IGNORECASE).strip()
+
+        if not clean or clean.lower() == "facebook":
+            return []
+
+        candidates = []
         if " - " in clean:
             parts = clean.split(" - ", 1)
-            raw_snippet = parts[1].strip()
+            for part in parts:
+                p_clean = re.sub(r"\.{2,}", "", part).strip()
+                if len(p_clean) >= 4:
+                    candidates.append(p_clean)
         else:
-            raw_snippet = clean
+            candidates.append(re.sub(r"\.{2,}", "", clean).strip())
 
-        raw_snippet = re.sub(r"\.{2,}", "", raw_snippet).strip()
         anchors = []
-        if raw_snippet:
-            anchors.append(raw_snippet[:40].strip())
-        clean_words = re.findall(r"[\w\u00C0-\u1EF9\uD835\uDC00-\uD835\uDC33]{3,}", raw_snippet)
-        if clean_words:
-            anchors.append(" ".join(clean_words[:4]))
+        for cand in candidates:
+            if cand:
+                anchors.append(cand[:40].strip())
+            # Unicode math bold/italic (\U0001D400-\U0001D7FF) & all international word characters
+            words = re.findall(r"[\w\U0001D400-\U0001D7FF]{3,}", cand, flags=re.UNICODE)
+            if words:
+                anchors.append(" ".join(words[:4]))
+
         return [a for a in dict.fromkeys(anchors) if a]
-    except Exception:
+    except Exception as exc:
+        logger.warning(f"Error in auto_discover_anchors: {exc}")
         return []
 
 
@@ -730,4 +924,360 @@ class PersistentBrowserSession:
                     pass
                 self.context = None
             clean_profile_locks(self.profile_dir)
+
+
+SCOPED_EXTRACTION_JS = r"""(postUrl) => {
+    const res = {
+        card_found: false,
+        text: null,
+        published_at_raw: null,
+        like_count_raw: null,
+        comment_count_raw: null,
+        comment_is_zero: false,
+        share_count_raw: null,
+        view_count_raw: null,
+        media_type: 'text',
+        ts_coords: null,
+        author_name: null,
+        review_reasons: []
+    };
+
+    let card = null;
+    let msg = null;
+
+    // 1a. If postUrl is provided, match anchor matching the permalink/ID first
+    if (postUrl) {
+        const cleanPath = postUrl.replace(/^https?:\/\/(www\.)?facebook\.com\/?/, '').split('?')[0].replace(/\/$/, '');
+        const allAnchors = Array.from(document.querySelectorAll('a[href]'));
+        for (const a of allAnchors) {
+            const h = a.href || '';
+            if (cleanPath && h.includes(cleanPath)) {
+                let curr = a;
+                while (curr && curr !== document.body) {
+                    if (curr.querySelector('[role="toolbar"], [aria-label*="reactions" i], [aria-label*="Like" i]')) {
+                        card = curr;
+                        break;
+                    }
+                    curr = curr.parentElement;
+                }
+                if (card) break;
+            }
+        }
+    }
+
+    // 1b. Fallback: match first message container with its toolbar ancestor
+    if (!card) {
+        msg = document.querySelector('div[data-ad-preview="message"], div[data-ad-comet-preview="message"]');
+        if (msg) {
+            let curr = msg;
+            while (curr && curr !== document.body) {
+                if (curr.querySelector('[role="toolbar"], [aria-label*="reactions" i], [aria-label*="Like" i]')) {
+                    card = curr;
+                    break;
+                }
+                curr = curr.parentElement;
+            }
+        }
+    }
+
+    // 1c. Fallback: find post card via post permalink or toolbar in main
+    if (!card) {
+        const main = document.querySelector('[role="main"]') || document.body;
+        const postLink = Array.from(main.querySelectorAll('a')).find(a => {
+            const h = a.href || '';
+            if (h.includes('comment_id=')) return false;
+            if (a.closest('[role="article"]') && a.closest('[role="article"]').getAttribute('aria-label')?.toLowerCase().includes('comment')) return false;
+            return (h.includes('/posts/') || h.includes('permalink.php') || h.includes('story_fbid=') || h.includes('/share/p/')) && a.getBoundingClientRect().width > 15 && a.getBoundingClientRect().x < 500;
+        });
+
+        if (postLink) {
+            let curr = postLink;
+            while (curr && curr !== main) {
+                if (curr.querySelector('[role="toolbar"], [aria-label*="reactions" i], [aria-label*="Like" i]')) {
+                    card = curr;
+                    break;
+                }
+                curr = curr.parentElement;
+            }
+        }
+    }
+
+    if (!card) {
+        res.review_reasons.push("Could not isolate distinct post container from comments/feed.");
+        return res;
+    }
+
+    res.card_found = true;
+
+    // 2. Expand "See more" / "Xem thêm" / "Ver más"
+    const moreBtns = Array.from(card.querySelectorAll('[role="button"], span[role="button"], div[role="button"]')).filter(b => {
+        const t = (b.innerText || '').trim();
+        return /^(?:see more|xem thêm|ver más|mehr anzeigen|voir plus)$/i.test(t);
+    });
+    moreBtns.forEach(b => { try { b.click(); } catch(e) {} });
+
+    // 3. Extract text strictly from card
+    const cardMsg = card.querySelector('div[data-ad-preview="message"], div[data-ad-comet-preview="message"]');
+    if (cardMsg) {
+        res.text = cardMsg.innerText.trim();
+    } else {
+        const textNodes = Array.from(card.querySelectorAll('div[dir="auto"], span[dir="auto"]')).filter(d => {
+            if (d.closest('[role="toolbar"]') || d.closest('[role="article"]') || d.closest('form')) return false;
+            const t = (d.innerText || '').trim();
+            return t.length > 20;
+        });
+        textNodes.sort((a, b) => (b.innerText || '').length - (a.innerText || '').length);
+        if (textNodes.length > 0) res.text = textNodes[0].innerText.trim();
+    }
+
+    // 4. Locate timestamp link in card
+    const postLink = Array.from(card.querySelectorAll('a')).find(a => {
+        const href = a.href || '';
+        if (href.includes('comment_id=')) return false;
+        if (a.closest('[role="article"]') && a.closest('[role="article"]').getAttribute('aria-label')?.toLowerCase().includes('comment')) return false;
+        return (href.includes('/posts/') || href.includes('permalink.php') || href.includes('story_fbid=')) && a.getBoundingClientRect().width > 15;
+    });
+
+    if (postLink) {
+        const aria = (postLink.getAttribute('aria-label') || '').trim();
+        if (aria && /\d/.test(aria)) {
+            res.published_at_raw = aria;
+        }
+        const r = postLink.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) {
+            res.ts_coords = { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+        }
+    }
+
+    // 5. Metrics
+    // 5.0 Compact metric summary row: e.g. "44\n2\n6" or "44\n2"
+    const metricDivs = Array.from(card.querySelectorAll('div')).filter(d => 
+        /^\d[\d.,]*[KkMmB]?\n\d[\d.,]*[KkMmB]?(\n\d[\d.,]*[KkMmB]?)?$/.test((d.innerText || '').trim())
+    );
+    if (metricDivs.length > 0) {
+        const parts = metricDivs[0].innerText.trim().split('\n').map(s => s.trim());
+        if (parts.length >= 1 && !res.like_count_raw) res.like_count_raw = parts[0];
+        if (parts.length >= 2 && !res.comment_count_raw) res.comment_count_raw = parts[1];
+        if (parts.length >= 3 && !res.share_count_raw) res.share_count_raw = parts[2];
+    }
+
+    // 5.1 Reactions / Likes
+    if (!res.like_count_raw) {
+        const reactionEl = card.querySelector('[aria-label*="reacted to this" i], [aria-label*="reactions" i], [aria-label*="bày tỏ cảm xúc" i]');
+        if (reactionEl) {
+            const m = (reactionEl.getAttribute('aria-label') || '').match(/([\d.,]+[KkMmB]?|\d+)/);
+            res.like_count_raw = m ? m[1] : reactionEl.innerText.trim();
+        } else {
+            const tbText = card.querySelector('[role="toolbar"]')?.innerText || '';
+            const m = tbText.match(/\b(\d[\d.,]*[KkMmB]?)\b/);
+            if (m) res.like_count_raw = m[1];
+        }
+    }
+
+    // 5.2 Comments
+    const cardText = card.innerText || '';
+    if (!res.comment_count_raw) {
+        const cMatch = cardText.match(/\b(\d[\d.,]*[KkMmB]?)\s+(?:comments?|bình luận|comentarios)\b/i);
+        if (cMatch) {
+            res.comment_count_raw = cMatch[1];
+        } else if (/no comments yet|chưa có bình luận|sé el primero en comentar/i.test(cardText)) {
+            res.comment_is_zero = true;
+        }
+    }
+
+    // 5.3 Shares
+    if (!res.share_count_raw) {
+        const sMatch = cardText.match(/\b(\d[\d.,]*[KkMmB]?)\s+(?:shares?|lượt chia sẻ|veces compartido)\b/i);
+        if (sMatch) res.share_count_raw = sMatch[1];
+    }
+
+    // 5.4 Views
+    const vMatch = cardText.match(/\b(\d[\d.,]*[KkMmB]?)\s+(?:views?|lượt xem|reproducciones)\b/i);
+    if (vMatch) res.view_count_raw = vMatch[1];
+
+    // 6. Media type
+    const vids = Array.from(card.querySelectorAll('video')).filter(v => v.clientWidth >= 150 && v.clientHeight >= 150);
+    if (vids.length > 0 || card.querySelector('[data-video-id]')) {
+        res.media_type = 'video';
+    } else {
+        const imgs = Array.from(card.querySelectorAll('img')).filter(img => {
+            const w = img.naturalWidth || img.clientWidth || 0;
+            const h = img.naturalHeight || img.clientHeight || 0;
+            const src = img.src || '';
+            const alt = img.alt || '';
+            const isEmoji = src.includes('emoji.php') || src.includes('rsrc.php');
+            const isAvatar = (w < 100 && h < 100);
+            const isFbPhotoAlt = /^May be an image of/i.test(alt) || /^Có thể là hình ảnh về/i.test(alt) || /^No photo description/i.test(alt);
+            return (!isEmoji && !isAvatar && (w >= 140 || h >= 140)) || isFbPhotoAlt;
+        });
+        if (imgs.length > 0 || card.querySelector('a[href*="/photo"]')) {
+            res.media_type = 'image';
+        } else if (card.querySelector('a[target="_blank"][rel*="nofollow"], a[href*="l.facebook.com"]')) {
+            res.media_type = 'link';
+        }
+    }
+
+    // 7. Author Name / Heading
+    const authorEl = card.querySelector('h2, h3, h4, strong');
+    if (authorEl) res.author_name = authorEl.innerText.trim();
+
+    return res;
+};"""
+
+
+def extract_scoped_post_data(page, post_url=None, default_sport=None, reference_tz=VIETNAM_TZ):
+    """Extracts post text, metrics, published timestamp, and media scoped strictly to the post container.
+    Returns:
+        (record_17_col, tech_metadata)
+    """
+    url = post_url or page.url
+    page_text = ""
+    try:
+        page_text = (page.evaluate("() => document.body.innerText") or "").lower()
+    except Exception:
+        pass
+
+    # Check for deleted/unavailable content
+    if any(term in page_text for term in [
+        "this content isn't available right now",
+        "content not found",
+        "bài viết này không còn hiển thị",
+        "trang này không tồn tại",
+        "este contenido no está disponible",
+    ]):
+        tech_meta = {
+            "status": "unavailable",
+            "review_reasons": ["Post is unavailable, deleted, or restricted by privacy settings."],
+            "raw_published_at": None,
+            "time_precision": "insufficient_evidence",
+            "is_approximate": {},
+            "missing_reasons": {"text": "post_unavailable"},
+        }
+        record = build_dataset_record(
+            post_url=url,
+            text=None,
+            sport_category=default_sport,
+        )
+        return record, tech_meta
+
+    # Execute scoped DOM evaluation
+    try:
+        dom_res = page.evaluate(SCOPED_EXTRACTION_JS, url)
+    except Exception as exc:
+        logger.error(f"DOM evaluation error on {url}: {exc}")
+        dom_res = {
+            "card_found": False,
+            "text": None,
+            "published_at_raw": None,
+            "like_count_raw": None,
+            "comment_count_raw": None,
+            "comment_is_zero": False,
+            "share_count_raw": None,
+            "view_count_raw": None,
+            "media_type": "text",
+            "ts_coords": None,
+            "review_reasons": [f"DOM evaluation failed: {exc}"],
+        }
+
+    raw_published = dom_res.get("published_at_raw")
+    ts_coords = dom_res.get("ts_coords")
+
+    # If timestamp was not directly available in aria-label, hover over coords to trigger tooltip
+    if (not raw_published or not re.search(r"\d", raw_published)) and ts_coords:
+        try:
+            page.mouse.move(ts_coords["x"], ts_coords["y"])
+            page.wait_for_timeout(700)
+            tooltip_txt = page.evaluate(r'''() => {
+                const tooltips = Array.from(document.querySelectorAll('[role="tooltip"]'));
+                const found = tooltips.map(t => (t.innerText || '').trim()).find(t => t.length > 5 && /\d/.test(t));
+                return found || null;
+            }''')
+            if tooltip_txt:
+                raw_published = tooltip_txt
+        except Exception as exc:
+            logger.debug(f"Tooltip hover error: {exc}")
+
+    # Standardize published timestamp
+    iso_published, time_precision = parse_facebook_timestamp(raw_published, reference_tz=reference_tz)
+
+    # Process counts with approximation metadata
+    like_val, like_approx = parse_numeric_count_with_meta(dom_res.get("like_count_raw"))
+    
+    if dom_res.get("comment_is_zero"):
+        comment_val, comment_approx = 0, False
+    else:
+        comment_val, comment_approx = parse_numeric_count_with_meta(dom_res.get("comment_count_raw"))
+
+    share_val, share_approx = parse_numeric_count_with_meta(dom_res.get("share_count_raw"))
+    view_val, view_approx = parse_numeric_count_with_meta(dom_res.get("view_count_raw"))
+
+    # Author and post IDs
+    final_post_id = extract_post_id(page.url) or extract_post_id(url)
+    final_author_id = extract_author_id(page.url) or extract_author_id(url)
+
+    # Sport category normalization
+    extracted_text = dom_res.get("text")
+    normalized_sport = validate_or_normalize_sport(default_sport)
+    if not normalized_sport and extracted_text:
+        normalized_sport = validate_or_normalize_sport(extracted_text)
+
+    # Compile review reasons and missing field reasons
+    review_reasons = list(dom_res.get("review_reasons") or [])
+    missing_reasons = {}
+
+    if not extracted_text:
+        missing_reasons["text"] = "text_not_found"
+        review_reasons.append("Post caption text could not be extracted.")
+    if iso_published is None:
+        missing_reasons["published_at"] = time_precision
+    if like_val is None:
+        missing_reasons["like_count"] = "no_reaction_badge_found"
+    if comment_val is None:
+        missing_reasons["comment_count"] = "no_comment_count_found"
+    if share_val is None:
+        missing_reasons["share_count"] = "no_share_count_found"
+    if view_val is None:
+        missing_reasons["view_count"] = "view_count_not_displayed"
+    if not normalized_sport:
+        missing_reasons["sport_category"] = "unidentified_sport"
+
+    # Status classification
+    if not dom_res.get("card_found"):
+        status = "needs_review"
+    elif extracted_text and not review_reasons:
+        status = "success"
+    elif extracted_text:
+        status = "needs_review"
+    else:
+        status = "failed"
+
+    tech_meta = {
+        "status": status,
+        "review_reasons": review_reasons,
+        "raw_published_at": raw_published,
+        "time_precision": time_precision,
+        "is_approximate": {
+            "like_count": like_approx,
+            "comment_count": comment_approx,
+            "share_count": share_approx,
+            "view_count": view_approx,
+        },
+        "missing_reasons": missing_reasons,
+    }
+
+    record_17_col = build_dataset_record(
+        post_url=page.url if page.url and "facebook.com" in page.url else url,
+        text=extracted_text,
+        published_at=iso_published,
+        author_id=final_author_id,
+        post_id=final_post_id,
+        sport_category=normalized_sport,
+        like_count=like_val,
+        comment_count=comment_val,
+        share_count=share_val,
+        view_count=view_val,
+        media_type=dom_res.get("media_type", "text"),
+    )
+
+    return record_17_col, tech_meta
 
