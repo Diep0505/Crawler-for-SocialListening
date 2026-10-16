@@ -180,6 +180,7 @@ python3 facebook_pipeline.py --page "https://www.facebook.com/maratonvalencia" -
 | `--limit` | Integer | `None` | Maximum number of posts to process in the current execution. |
 | `--sport` | String | `None` | Default sport category fallback if not detected from text. |
 | `--retry-failed` | Flag | `False` | Re-queues tasks previously marked with `failed` status. |
+| `--resume` | Flag | `False` | Resumes previous run (default behavior; skips completed tasks). |
 | `--no-followers` | Flag | `False` | Disables author follower scraping for faster throughput. |
 | `--headless` | Flag | `False` | Launches browser in invisible headless mode. |
 

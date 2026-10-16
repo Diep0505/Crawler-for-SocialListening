@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from cloakbrowser import launch_persistent_context
+import facebook_dataset as fd
 
 BASE_DIR = Path(__file__).resolve().parent
 PROFILE_DIR = BASE_DIR / "profiles" / "facebook"
@@ -8,6 +9,7 @@ PROFILE_DIR = BASE_DIR / "profiles" / "facebook"
 
 def main():
     PROFILE_DIR.parent.mkdir(parents=True, exist_ok=True)
+    fd.clean_profile_locks(PROFILE_DIR)
 
     context = launch_persistent_context(
         str(PROFILE_DIR),
@@ -28,6 +30,7 @@ def main():
 
     finally:
         context.close()
+        fd.clean_profile_locks(PROFILE_DIR)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,12 @@ Example:
 Can also use --sources sources.txt (one Page URL per line).
 Output: output/facebook_discovery/post_queue.jsonl and discovery_report.json.
 
+When scrolling stalls, waits and reloads up to --max-refreshes times per source
+(default: 2). Use --max-refreshes 0 to disable recovery. Saved URLs are retained
+and duplicates skipped after reload. Reloading may return to the top; it does
+not guarantee access to older posts or remove Facebook-side restrictions.
+--limit and --max-scrolls remain hard caps, including after recovery.
+
 This is a URL discovery tool for local testing, not a complete archival collector.
 Accepts permalinks matching /posts/, story.php, permalink.php.
 Does not treat photo/video/reel URLs as primary post IDs.
@@ -64,10 +70,21 @@ def parse_post_url(value):
             "post_id": token,
             "discovery_key": f"facebook:post:{token}",
             "owner_token": owner,
+            "is_share_alias": False,
+        }
+    share_match = re.fullmatch(r"/share/p/([^/]+)/?\Z", parsed.path)
+    if share_match:
+        token = share_match.group(1)
+        return {
+            "post_url": f"https://www.facebook.com/share/p/{token}/",
+            "post_id": token,
+            "discovery_key": f"facebook:post:{token}",
+            "owner_token": "share",
+            "is_share_alias": True,
         }
     if parsed.path.rstrip("/") in {"/story.php", "/permalink.php"}:
         query = parse_qs(parsed.query)
-        tokens = query.get("story_fbid", [])
+        tokens = query.get("story_fbid", []) or query.get("fbid", [])
         owners = query.get("id", [])
         if len(tokens) != 1 or len(owners) != 1:
             return None
@@ -79,16 +96,19 @@ def parse_post_url(value):
             "post_id": token,
             "discovery_key": f"facebook:post:{token}",
             "owner_token": owner,
+            "is_share_alias": False,
         }
     return None
 
 
 def parse_source_url(value):
-    """Accepts Page URLs like /pagename or profile.php?id=...; rejects post URLs."""
+    """Accepts Page URLs like /pagename or profile.php?id=..., or Home/News Feed (/ or /feed)."""
     parsed = facebook_url(value.strip())
     if parsed is None:
         raise ValueError(f"Invalid source URL: {value}")
     path = parsed.path.strip("/")
+    if not path or path.lower() in ("feed", "home.php"):
+        return f"{parsed.scheme}://{parsed.netloc}/", "news_feed"
     if path == "profile.php":
         ids = parse_qs(parsed.query).get("id", [])
         if len(ids) == 1 and ids[0].isdigit():
@@ -97,7 +117,7 @@ def parse_source_url(value):
         return f"https://www.facebook.com/{path}/", path
     if path and "/" not in path and path.lower() not in RESERVED and not path.lower().endswith(".php"):
         return f"https://www.facebook.com/{path}/", path
-    raise ValueError(f"Expected Page URL, not post/group/homepage: {value}")
+    raise ValueError(f"Expected Page URL or Feed URL, not post/group: {value}")
 
 
 def append_records(path, records):
@@ -168,13 +188,169 @@ def positive_int(value):
     return number
 
 
+def nonnegative_int(value):
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("Value must be 0 or greater.")
+    return number
+
+
+def refresh_after_idle(page, cooldown_seconds):
+    """Reload a stalled feed in its current session; never reload a login wall.
+
+    Returns an access issue, or None when reloaded. Navigation failures are
+    handled by the existing source-level browser error handler.
+    """
+    issue = access_issue(page)
+    if issue:
+        return issue
+    if cooldown_seconds:
+        page.wait_for_timeout(cooldown_seconds * 1000)
+        issue = access_issue(page)
+        if issue:
+            return issue
+    page.reload(wait_until="domcontentloaded", timeout=60000)
+    issue = access_issue(page)
+    if issue:
+        return issue
+    # DOMContentLoaded does not mean the dynamically rendered feed is ready.
+    # Later scan rounds continue waiting if posts have not appeared yet.
+    page.wait_for_timeout(3000)
+    return access_issue(page)
+
+
+def discover_page_posts(
+    page_url,
+    limit=30,
+    profile_dir=BASE_DIR / "profiles" / "facebook",
+    headless=False,
+    max_scrolls=60,
+    idle_rounds=10,
+    max_refreshes=2,
+    refresh_wait=15,
+    max_hours=None,
+    existing_seen_keys=None,
+    context=None,
+):
+    """Discovers post permalinks from a given Facebook Page URL using shared recovery and refresh logic.
+    Returns a list of dicts with post_url, post_id, etc.
+    """
+    clean_url, owner = parse_source_url(page_url)
+    is_news_feed = (owner == "news_feed")
+    profile_path = Path(profile_dir)
+    
+    import facebook_dataset as fd
+    fd.clean_profile_locks(profile_path)
+
+    owns_context = False
+    if context is None:
+        if not profile_path.is_dir():
+            raise FileNotFoundError(f"Profile directory not found: {profile_path}")
+        from cloakbrowser import launch_persistent_context
+        context = launch_persistent_context(
+            str(profile_path),
+            headless=headless,
+            args=[f"--fingerprint={FINGERPRINT_SEED}"],
+            viewport={"width": 1280, "height": 900},
+        )
+        owns_context = True
+
+    discovered = []
+    seen = set(existing_seen_keys or [])
+    deadline = (time.monotonic() + max_hours * 3600) if (max_hours and max_hours > 0) else None
+
+    page = context.new_page()
+    try:
+        page.goto(clean_url, wait_until="domcontentloaded", timeout=60000)
+        time.sleep(4)
+        owners = {owner.lower()}
+        try:
+            _, redirected_owner = parse_source_url(page.url)
+            owners.add(redirected_owner.lower())
+        except ValueError:
+            pass
+
+        idle = 0
+        refreshes = 0
+        source_seen = set()
+
+        for scroll_round in range(1, max_scrolls + 1):
+            if deadline and time.monotonic() >= deadline:
+                break
+
+            issue = access_issue(page)
+            if issue:
+                raise ValueError(issue)
+
+            snapshot = page.evaluate(SCAN_JS)
+            discovered_this_round = 0
+
+            for link in snapshot["links"]:
+                parsed_post = parse_post_url(link["href"])
+                if not parsed_post:
+                    continue
+                post_owner = parsed_post["owner_token"].lower()
+                if not is_news_feed and post_owner not in owners and not (post_owner.isdigit() and not any(x.isdigit() for x in owners)):
+                    continue
+
+                key = parsed_post["discovery_key"]
+                if key not in source_seen:
+                    source_seen.add(key)
+                    discovered_this_round += 1
+
+                if key not in seen:
+                    seen.add(key)
+                    discovered.append({
+                        **parsed_post,
+                        "platform": "facebook",
+                        "source_url": clean_url,
+                        "discovered_at": utc_now(),
+                    })
+                    if len(discovered) >= limit:
+                        break
+
+            if len(discovered) >= limit:
+                break
+
+            idle = idle + 1 if discovered_this_round == 0 else 0
+            if idle >= idle_rounds:
+                if refreshes >= max_refreshes:
+                    break
+                refreshes += 1
+                issue = refresh_after_idle(page, refresh_wait)
+                if issue:
+                    raise ValueError(issue)
+                source_seen.clear()
+                idle = 0
+                continue
+
+            page.mouse.wheel(0, 750)
+            time.sleep(3)
+
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
+        if owns_context:
+            try:
+                context.close()
+            except Exception:
+                pass
+            fd.clean_profile_locks(profile_path)
+
+    return discovered
+
+
 def get_arguments():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--source", action="append", default=[], help="Page URL; can be repeated.")
     parser.add_argument("--sources", type=Path, help="UTF-8 file, one Page URL per line, '#' comments ignored.")
     parser.add_argument("--limit", type=positive_int, default=30, help="Max new unique URLs for this run (default: 30).")
-    parser.add_argument("--max-scrolls", type=positive_int, default=60, help="Max scroll rounds per source.")
-    parser.add_argument("--idle-rounds", type=positive_int, default=10, help="Stop source after this many idle rounds.")
+    parser.add_argument("--max-scrolls", type=positive_int, default=60, help="Total scan rounds per source, including after refresh.")
+    parser.add_argument("--idle-rounds", type=positive_int, default=10, help="Consecutive rounds with no newly encountered post URLs before recovery.")
+    parser.add_argument("--max-refreshes", type=nonnegative_int, default=2, help="Max reload attempts per source when scrolling stalls; 0 disables recovery.")
+    parser.add_argument("--refresh-wait", type=nonnegative_int, default=15, help="Seconds to wait before each reload (default: 15).")
     parser.add_argument("--profile", type=Path, default=BASE_DIR / "profiles" / "facebook")
     parser.add_argument("--output", type=Path, default=BASE_DIR / "output" / "facebook_discovery")
     args = parser.parse_args()
@@ -219,6 +395,10 @@ def main():
         "started_at": utc_now(), "finished_at": None, "status": "running",
         "requested_new_urls": args.limit, "previous_unique_urls": len(seen),
         "new_unique_urls": 0, "total_unique_urls": len(seen), "sources": [],
+        "recovery_settings": {"max_refreshes_per_source": args.max_refreshes,
+                              "refresh_wait_seconds": args.refresh_wait,
+                              "idle_rounds": args.idle_rounds,
+                              "max_scan_rounds_per_source": args.max_scrolls},
         "scope": "Page permalink discovery only; not a verified dataset or complete Page archive",
         "metric_definitions": {"like_count": "total post reactions", "author_followers": "follower count only"},
     }
@@ -235,12 +415,14 @@ def main():
                 break
             detail = {"source_url": source_url, "final_url": None, "new_urls": 0,
                       "rounds": 0, "status": "running", "error": None,
+                      "refreshes": 0, "refresh_events": [],
                       "article_count_last": 0, "link_count_last": 0,
                       "recognized_permalink_count_last": 0, "other_owner_links_skipped": 0,
                       "candidate_link_examples": []}
             report["sources"].append(detail)
             print(f"Source: {source_url}", flush=True)
             try:
+                is_news_feed = (owner == "news_feed")
                 page.goto(source_url, wait_until="domcontentloaded", timeout=60000)
                 time.sleep(4)
                 owners = {owner.lower()}
@@ -270,8 +452,8 @@ def main():
                             continue
                         detail["recognized_permalink_count_last"] += 1
                         post_owner = parsed_post["owner_token"].lower()
-                        if post_owner in owners:
-                            relation = "url_owner_matches_seed"
+                        if is_news_feed or post_owner in owners:
+                            relation = "feed_post" if is_news_feed else "url_owner_matches_seed"
                         elif post_owner.isdigit() and not any(x.isdigit() for x in owners):
                             relation = "numeric_owner_unverified"
                         else:
@@ -308,10 +490,46 @@ def main():
                     if report["new_unique_urls"] >= args.limit:
                         detail["status"] = "run_limit_reached"
                         break
+                    if number >= args.max_scrolls:
+                        detail["status"] = "max_scrolls_reached"
+                        break
                     idle = idle + 1 if discovered_this_round == 0 else 0
                     if idle >= args.idle_rounds:
-                        detail["status"] = "no_new_links_in_loaded_dom"
-                        break
+                        if detail["refreshes"] >= args.max_refreshes:
+                            detail["status"] = ("no_new_links_after_refreshes" if detail["refreshes"]
+                                                else "no_new_links_in_loaded_dom")
+                            break
+                        detail["refreshes"] += 1
+                        event = {"attempt": detail["refreshes"], "round": number,
+                                 "started_at": utc_now(), "finished_at": None,
+                                 "new_urls_before_refresh": detail["new_urls"],
+                                 "status": "attempting"}
+                        detail["refresh_events"].append(event)
+                        detail["status"] = "refreshing"
+                        save_report(report_file, report)
+                        print(f"  No new links for {idle} rounds. Waiting {args.refresh_wait}s, "
+                              f"then refresh {detail['refreshes']}/{args.max_refreshes}.", flush=True)
+                        try:
+                            issue = refresh_after_idle(page, args.refresh_wait)
+                        except Error as exc:
+                            event["status"], event["error"] = "browser_error", str(exc)[:1500]
+                            raise
+                        finally:
+                            event["finished_at"] = utc_now()
+                        if issue:
+                            event["status"] = "access_required"
+                            detail["status"], detail["error"] = "access_required", issue
+                            stop_for_access = True
+                            break
+                        event["status"] = "reloaded"
+                        detail["status"] = "running"
+                        # Reset only this pass's traversal tracker, not the saved
+                        # deduplication keys. This lets us scroll past old posts
+                        # again without treating them as new dataset records.
+                        source_seen.clear()
+                        idle = 0
+                        save_report(report_file, report)
+                        continue
                     page.mouse.wheel(0, 750)
                     time.sleep(3)
                 else:

@@ -204,6 +204,101 @@ class TestFacebookScraperUnits(unittest.TestCase):
         self.assertNotIn("Adjacent post caption", data["text"])
         self.assertNotIn("Breaking news on football", data["text"])
 
+    def test_multilingual_numeric_parsing(self):
+        """Verifies Spanish and French number parsing."""
+        val, approx = fd.parse_numeric_count_with_meta("1,9 mil")
+        self.assertEqual(val, 1900)
+        self.assertTrue(approx)
+
+        val, approx = fd.parse_numeric_count_with_meta("2 millones")
+        self.assertEqual(val, 2000000)
+        self.assertTrue(approx)
+
+    def test_vietnamese_timestamp_parsing(self):
+        """Verifies Vietnamese timestamp format standardization."""
+        iso, prec = fd.parse_facebook_timestamp("30 tháng 12, 2022 lúc 18:30")
+        self.assertEqual(prec, "exact")
+        self.assertTrue(iso.startswith("2022-12-30T18:30:00"))
+
+    def test_mentions_email_exclusion(self):
+        """Verifies that email addresses are not falsely extracted as account mentions."""
+        text = "Liên hệ với chúng tôi qua contact@valenciamarathon.com hoặc tag @valenciamarathon."
+        mentions = fd.extract_mentions(text)
+        self.assertEqual(mentions, ["@valenciamarathon"])
+        self.assertNotIn("@valenciamarathon.com", mentions)
+
+    def test_mentions_combined_text_and_dom_tags(self):
+        """Verifies merging of plain text @mentions and DOM anchor tags, stripping trailing punctuation."""
+        text = "Check out @valenciamarathon! and @running_spain."
+        dom_tags = ["@maratonvalencia", "energiaedp", "@valenciamarathon"]
+        combined = fd.extract_mentions(text, additional_mentions=dom_tags)
+        self.assertEqual(combined, ["@valenciamarathon", "@running_spain", "@maratonvalencia", "@energiaedp"])
+
+    def test_dom_fixture_tagged_link_mention_extraction(self):
+        """Verifies that SCOPED_EXTRACTION_JS extracts tagged profile/page anchors from the post caption."""
+        from playwright.sync_api import sync_playwright
+
+        html_fixture = """
+        <html>
+          <body>
+            <div id="target-post" role="article" class="main-card">
+              <div class="header">
+                <a href="/energiaedp/posts/12345" role="link">energiaedp</a>
+              </div>
+              <div data-ad-preview="message" class="caption-container">
+                <span>Os esperamos en el stand del </span>
+                <a href="https://www.facebook.com/maratonvalencia?__cft__[0]=AZ123&__tn__=-]K-R" role="link">Maratón Valencia</a>
+                <span> con la mejor energía. </span>
+                <a href="https://www.facebook.com/hashtag/edprunfortomorrow">#EDPRunForTomorrow</a>
+              </div>
+              <div role="toolbar">
+                <button aria-label="Like"></button>
+              </div>
+            </div>
+          </body>
+        </html>
+        """
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_content(html_fixture)
+            data = page.evaluate(fd.SCOPED_EXTRACTION_JS, "https://www.facebook.com/energiaedp/posts/12345")
+            browser.close()
+
+        self.assertEqual(data.get("dom_mentions"), ["@maratonvalencia"])
+
+
+    def test_numeric_object_url_author_rejection(self):
+        """Verifies that numeric object URLs are NOT treated as author handles."""
+        # Top-level numeric slug must return None, not the object ID
+        author = fd.extract_author_id("https://www.facebook.com/3211971012344948")
+        self.assertIsNone(author)
+
+        # Standard post URL with author handle
+        author_valid = fd.extract_author_id("https://www.facebook.com/atletismoRFEA/posts/12345")
+        self.assertEqual(author_valid, "atletismoRFEA")
+
+        # Profile.php with numeric ID query
+        author_profile = fd.extract_author_id("https://www.facebook.com/profile.php?id=100054321")
+        self.assertEqual(author_profile, "100054321")
+
+    def test_collected_at_utc_compliance(self):
+        """Verifies collected_at defaults to UTC timezone."""
+        rec = fd.build_dataset_record("https://www.facebook.com/atletismoRFEA/posts/123")
+        collected_at = rec["collected_at"]
+        self.assertTrue(collected_at.endswith("+00:00") or collected_at.endswith("Z"))
+
+    def test_discover_post_url_parsing(self):
+        """Verifies discover tool parsing of both /posts/ and /share/p/ URLs."""
+        import cloak_facebook_discover as disc
+        p1 = disc.parse_post_url("https://www.facebook.com/author1/posts/123456789/")
+        self.assertIsNotNone(p1)
+        self.assertEqual(p1["post_id"], "123456789")
+
+        p2 = disc.parse_post_url("https://www.facebook.com/share/p/1Lj5fMfmVg/")
+        self.assertIsNotNone(p2)
+        self.assertEqual(p2["post_id"], "1Lj5fMfmVg")
+
 
 if __name__ == "__main__":
     unittest.main()
