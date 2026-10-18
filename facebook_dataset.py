@@ -34,6 +34,59 @@ from zoneinfo import ZoneInfo
 logger = logging.getLogger("facebook_dataset")
 VIETNAM_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
+# Statistical language detector singleton using lingua-language-detector
+_LINGUA_DETECTOR = None
+_LINGUA_AVAILABLE = None
+
+
+def _get_lingua_detector():
+    global _LINGUA_DETECTOR, _LINGUA_AVAILABLE
+    if _LINGUA_AVAILABLE is False:
+        return None
+    if _LINGUA_DETECTOR is not None:
+        return _LINGUA_DETECTOR
+    try:
+        from lingua import Language, LanguageDetectorBuilder
+        supported_langs = [
+            Language.ENGLISH,
+            Language.VIETNAMESE,
+            Language.SPANISH,
+            Language.FRENCH,
+            Language.PORTUGUESE,
+            Language.TAGALOG,
+            Language.GERMAN,
+            Language.ITALIAN,
+            Language.JAPANESE,
+            Language.CHINESE,
+            Language.INDONESIAN,
+            Language.THAI,
+            Language.ARABIC,
+        ]
+        _LINGUA_DETECTOR = LanguageDetectorBuilder.from_languages(*supported_langs).build()
+        _LINGUA_AVAILABLE = True
+        return _LINGUA_DETECTOR
+    except Exception as exc:
+        logger.warning(f"lingua-language-detector initialization error: {exc}. Using heuristic fallback.")
+        _LINGUA_AVAILABLE = False
+        return None
+
+
+LINGUA_LANG_MAP = {
+    "ENGLISH": "en",
+    "VIETNAMESE": "vi",
+    "SPANISH": "es",
+    "FRENCH": "fr",
+    "PORTUGUESE": "pt",
+    "TAGALOG": "tl",
+    "GERMAN": "de",
+    "ITALIAN": "it",
+    "JAPANESE": "ja",
+    "CHINESE": "zh",
+    "INDONESIAN": "id",
+    "THAI": "th",
+    "ARABIC": "ar",
+}
+
 # Exact list of 17 required columns in order
 REQUIRED_COLUMNS = [
     "post_id",
@@ -334,19 +387,33 @@ DOM_EXTRACT_JS = r"""(anchorsArg) => {
         if (m) res.share_count_raw = m[1];
     }
 
-    // 4.4. View count: Extracted from ANY post format whenever displayed by Facebook
-    const postText = postContainer.innerText || "";
-    const viewMatch = postText.match(/([\d.,]+[KkMm]?|\d+\s*(?:nghìn|ngàn|triệu|tr))\s*(?:views?|lượt xem)/i);
-    if (viewMatch) {
-        res.view_count_raw = viewMatch[1];
-    } else {
-        const viewEl = Array.from(postContainer.querySelectorAll('[aria-label*="view" i], [aria-label*="lượt xem" i]')).find(el => {
-            const aria = el.getAttribute('aria-label') || '';
-            return /([\d.,]+[KkMm]?|\d+\s*(?:nghìn|ngàn|triệu|tr))\s*(?:views?|lượt xem)/i.test(aria);
-        });
-        if (viewEl) {
-            const m = (viewEl.getAttribute('aria-label') || '').match(/([\d.,]+[KkMm]?|\d+\s*(?:nghìn|ngàn|triệu|tr))/i);
-            if (m) res.view_count_raw = m[1];
+    // 4.4. View count: Verified metric candidate only (default null, exclude command verbs & caption text)
+    res.view_count_raw = null;
+    res.view_status = "not_displayed";
+    const isInvalidViewCmd = (str) => {
+        if (!str) return true;
+        const s = str.trim();
+        return /^(?:view|xem|ver)\s+(?:profile|more|trang cá nhân|thêm|replies|câu trả lời|bình luận|comments|photos?|ảnh|videos?|history|insights|posts?)/i.test(s) ||
+               /(?:more\s+comments|replies|câu trả lời|bình luận\s+khác)$/i.test(s) ||
+               /target\s+is\s+\d+\s+views/i.test(s);
+    };
+    const viewMetricPat = /^(?:([\d.,]+[KkMmB]?|\d+\s*(?:nghìn|ngàn|triệu|tr|mil|millones))\s+(?:views?|lượt xem|reproducciones))$/i;
+    const candEls = Array.from(postContainer.querySelectorAll('span, div, [role="button"], a')).filter(el => {
+        if (el.closest('div[data-ad-preview="message"], div[data-ad-comet-preview="message"]')) return false;
+        if (el.closest('ul, [role="article"] [role="article"]')) return false;
+        const aria = (el.getAttribute('aria-label') || '').trim();
+        const txt = (el.innerText || '').trim();
+        if (isInvalidViewCmd(aria) || isInvalidViewCmd(txt)) return false;
+        return viewMetricPat.test(aria) || viewMetricPat.test(txt);
+    });
+    for (const el of candEls) {
+        const aria = (el.getAttribute('aria-label') || '').trim();
+        const txt = (el.innerText || '').trim();
+        const m = aria.match(viewMetricPat) || txt.match(viewMetricPat);
+        if (m) {
+            res.view_count_raw = m[1];
+            res.view_status = "verified";
+            break;
         }
     }
 
@@ -362,7 +429,7 @@ def parse_numeric_count_with_meta(value):
         return None, False
     if isinstance(value, (int, float)):
         return int(value), False
-    text = str(value).strip().lower()
+    text = str(value).replace("\u00a0", " ").replace("\u202f", " ").strip().lower()
     if not text or not re.search(r"\d", text):
         return None, False
 
@@ -616,7 +683,7 @@ SPORT_RULES = {
         re.IGNORECASE,
     ),
     "Basketball": re.compile(
-        r"\b(basketball|bóng rổ|nba|wnba|euroleague|vba|fiba|slam dunk|dunk|dunks|three-pointer|3-pointer|3pt|3pts|ném 3 điểm|buzzer beater|triple-double|double-double|alley-oop|layup|free throw|field goal|pts|reb|ast|rebounds?|assists?|lakers|warriors|celtics|bulls|bucks|nuggets|76ers|sixers|knicks|mavericks|mavs|clippers|timberwolves|cavaliers|cavs|pacers|grizzlies|pelicans|trail blazers|raptors|hornets|pistons|san antonio spurs|miami heat|utah jazz|orlando magic|okc thunder|oklahoma city thunder|washington wizards|phoenix suns|sacramento kings|brooklyn nets|atlanta hawks|houston rockets|lebron|steph curry|curry|giannis|tatum|jokic|doncic|wembanyama|durant)\b",
+        r"\b(basketball|bóng rổ|nba|wnba|euroleague|vba|fiba|slam dunk|dunk|dunks|three-pointer|3-pointer|3pt|3pts|ném 3 điểm|buzzer beater|triple-double|double-double|alley-oop|layup|free throw|field goal|pts|reb|ast|rebounds?|assists?|point guard|shooting guard|small forward|power forward|lakers|celtics|bulls|bucks|nuggets|76ers|sixers|knicks|mavericks|mavs|clippers|timberwolves|cavaliers|cavs|pacers|grizzlies|pelicans|trail blazers|raptors|hornets|pistons|san antonio spurs|miami heat|utah jazz|orlando magic|okc thunder|oklahoma city thunder|washington wizards|phoenix suns|sacramento kings|brooklyn nets|atlanta hawks|houston rockets|lebron|steph curry|stephen curry|giannis|tatum|jokic|jokić|doncic|dončić|wembanyama|durant|draymond green|dubs|gsw|heat nation|raptors nation|bad boys)\b|🏀|(?<!\bue\s)(?<!\bred\s)\bwarriors\b",
         re.IGNORECASE,
     ),
     "Tennis": re.compile(
@@ -672,7 +739,7 @@ SPORT_RULES = {
         re.IGNORECASE,
     ),
     "Shooting": re.compile(
-        r"\b(shooting|bắn súng)\b",
+        r"\b(target shooting|sport shooting|bắn súng thể thao|bắn súng|xạ thủ|issf|bắn súng đĩa bay|10m air rifle|50m rifle)\b",
         re.IGNORECASE,
     ),
     "Weightlifting": re.compile(
@@ -690,6 +757,552 @@ NON_SPORT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# -------------------------------------------------------------
+# NBA COMPETITION & EVIDENCE CLASSIFIER RULES
+# -------------------------------------------------------------
+NON_NBA_COMPETITION_RULES = {
+    "WNBA": re.compile(
+        r"\b(wnba|women's nba|caitlin clark|angel reese|new york liberty|las vegas aces|seattle storm|minnesota lynx|phoenix mercury|chicago sky|indiana fever|dallas wings|atlanta dream|connecticut sun|los angeles sparks|washington mystics)\b",
+        re.IGNORECASE,
+    ),
+    "UAAP": re.compile(
+        r"\b(uaap|university athletic association of the philippines|ue red warriors|up fighting maroons|ust growling tigers|ateneo blue eagles|de la salle green archers|adamson soaring falcons|nu bulldogs|feu tamaraws)\b",
+        re.IGNORECASE,
+    ),
+    "EuroLeague": re.compile(
+        r"\b(euroleague|euro league|panathinaikos|olympiacos|fenerbahce|anadolu efes|partizan|crvena zvezda|monaco basket|baskonia|virtus bologna|eurocup)\b",
+        re.IGNORECASE,
+    ),
+    "VBA": re.compile(
+        r"\b(vba|vietnam basketball association|saigon heat|thang long warriors|danang dragons|cantho catfish|hanoi buffaloes|nha trang dolphins|ho chi minh city wings)\b",
+        re.IGNORECASE,
+    ),
+    "FIBA": re.compile(
+        r"\b(fiba|fiba world cup|eurobasket|afrobasket|americup|fiba asia cup|olympic basketball)\b",
+        re.IGNORECASE,
+    ),
+    "NCAA": re.compile(
+        r"\b(ncaa|march madness|college basketball|final four|ncaa tournament|acc basketball|big ten basketball|sec basketball)\b",
+        re.IGNORECASE,
+    ),
+    "NBA2K": re.compile(
+        r"\b(nba 2k|nba2k|nba 2k2[0-9]|2k2[0-9]|mycareer|myteam|nba 2k league|ronnie 2k)\b",
+        re.IGNORECASE,
+    ),
+    "GLeague": re.compile(
+        r"\b(g league|g-league|nba g league|gleague|rip city remix|motor city cruise|delaware blue coats|austin spurs|south bay lakers|capital city go-go|santa cruz warriors|fort wayne mad ants|indiana mad ants|sioux falls skyforce|texas legends|birmingham squadron|college park skyhawks|greenboro swarm|iowa wolves|long island nets|maine celtics|memphis hustle|ontario clippers|osceola magic|raptors 905|salt lake city stars|stockton kings|westchester knicks|windy city bulls|wisconsin herd)\b",
+        re.IGNORECASE,
+    ),
+}
+
+NBA_EXPLICIT_RULE = re.compile(
+    r"\b(nba finals|nba playoffs|nba all-star|nba in-season tournament|in-season tournament|nba cup|nba draft|nba champion|nba championship|kia nba|nba on espn|nba on tnt|#nbafinals|#nbaplayoffs|#nbaallstar|#nba|(?<![Ww])nba|@nba)\b",
+    re.IGNORECASE,
+)
+
+NBA_TEAMS_RULE = re.compile(
+    r"\b(lakers|los angeles lakers|la lakers|celtics|boston celtics|golden state warriors|gsw|dubs|chicago bulls|bulls|milwaukee bucks|bucks|denver nuggets|nuggets|philadelphia 76ers|76ers|sixers|phila 76ers|dallas mavericks|mavericks|mavs|clippers|la clippers|los angeles clippers|timberwolves|minnesota timberwolves|wolves|cleveland cavaliers|cavaliers|cavs|indiana pacers|memphis grizzlies|grizzlies|new orleans pelicans|pelicans|portland trail blazers|trail blazers|blazers|toronto raptors|raptors|charlotte hornets|hornets|detroit pistons|pistons|san antonio spurs|spurs|miami heat|utah jazz|orlando magic|okc thunder|oklahoma city thunder|thunder|washington wizards|wizards|phoenix suns|sacramento kings|brooklyn nets|atlanta hawks|hawks|houston rockets|rockets|new york knicks|knicks)\b|(?<!\bue\s)(?<!\bred\s)\bwarriors\b",
+    re.IGNORECASE,
+)
+
+NBA_PERSONS_RULE = re.compile(
+    r"\b(lebron james|lebron|steph curry|stephen curry|kevin durant|giannis antetokounmpo|giannis|nikola jokic|nikola jokić|jokic|jokić|luka doncic|luka dončić|doncic|dončić|jayson tatum|tatum|victor wembanyama|wembanyama|wemby|anthony davis|jimmy butler|joel embiid|embiid|anthony edwards|shai gilgeous-alexander|sga|devin booker|booker|donovan mitchell|kyrie irving|kyrie|kawhi leonard|kawhi|paul george|damian lillard|dame lillard|jalen brunson|brunson|bam adebayo|tyrese haliburton|chet holmgren|ja morant|zion williamson|russell westbrook|james harden|chris paul|klay thompson|draymond green|steve kerr|erik spoelstra|gregg popovich|doc rivers|tyronn lue|kristaps porzingis|kristaps porziņģis|dennis schroder|dennis schröder|schroder|schröder|jonas valanciunas|jonas valančiūnas|valanciunas|valančiūnas|bogdan bogdanovic|bogdan bogdanović|bojan bogdanovic|bojan bogdanović|deni avdija|alperen sengun|alperen şengün|sengun|şengün)\b",
+    re.IGNORECASE,
+)
+
+BASKETBALL_ACTION_RULE = re.compile(
+    r"\b(three-pointer|3-pointer|3pt|3pts|triple-double|double-double|slam dunk|dunk|buzzer beater|alley-oop|free throw|field goal|fg%|rebounds?|assists?|steals?|blocks?|turnovers?|plus-minus|\+\/-|tip-off|half-time|overtime|box score|roster|trade deadline|head coach|point guard|shooting guard|small forward|power forward|center)\b",
+    re.IGNORECASE,
+)
+
+COMMERCIAL_PROMO_RULE = re.compile(
+    r"\b(we are hiring|apply now|job vacancy|job opening|tuyển dụng|store discount|promo code|coupon code|buy tickets now|ticket presale|shop now|merchandise sale|sweepstakes|enter to win|giveaway alert)\b",
+    re.IGNORECASE,
+)
+
+# -------------------------------------------------------------
+# NBA SOURCE REGISTRY FOR CONTEXTUAL CLASSIFICATION
+# -------------------------------------------------------------
+NBA_SOURCE_REGISTRY = {
+    # Official NBA
+    "nba": {"category": "official_nba", "franchise": None, "competition": "NBA"},
+    "nbacom": {"category": "official_nba", "franchise": None, "competition": "NBA"},
+
+    # Official 30 NBA Franchises (handles & canonical names)
+    "warriors": {"category": "official_nba_team", "franchise": "Golden State Warriors", "competition": "NBA"},
+    "losangeleslakers": {"category": "official_nba_team", "franchise": "Los Angeles Lakers", "competition": "NBA"},
+    "lakers": {"category": "official_nba_team", "franchise": "Los Angeles Lakers", "competition": "NBA"},
+    "celtics": {"category": "official_nba_team", "franchise": "Boston Celtics", "competition": "NBA"},
+    "chicagobulls": {"category": "official_nba_team", "franchise": "Chicago Bulls", "competition": "NBA"},
+    "bulls": {"category": "official_nba_team", "franchise": "Chicago Bulls", "competition": "NBA"},
+    "miamiheat": {"category": "official_nba_team", "franchise": "Miami Heat", "competition": "NBA"},
+    "heat": {"category": "official_nba_team", "franchise": "Miami Heat", "competition": "NBA"},
+    "raptors": {"category": "official_nba_team", "franchise": "Toronto Raptors", "competition": "NBA"},
+    "spurs": {"category": "official_nba_team", "franchise": "San Antonio Spurs", "competition": "NBA"},
+    "pacers": {"category": "official_nba_team", "franchise": "Indiana Pacers", "competition": "NBA"},
+    "detroitpistons": {"category": "official_nba_team", "franchise": "Detroit Pistons", "competition": "NBA"},
+    "trailblazers": {"category": "official_nba_team", "franchise": "Portland Trail Blazers", "competition": "NBA"},
+    "cavs": {"category": "official_nba_team", "franchise": "Cleveland Cavaliers", "competition": "NBA"},
+    "cavaliers": {"category": "official_nba_team", "franchise": "Cleveland Cavaliers", "competition": "NBA"},
+    "timberwolves": {"category": "official_nba_team", "franchise": "Minnesota Timberwolves", "competition": "NBA"},
+    "denvernuggets": {"category": "official_nba_team", "franchise": "Denver Nuggets", "competition": "NBA"},
+    "nuggets": {"category": "official_nba_team", "franchise": "Denver Nuggets", "competition": "NBA"},
+    "philadelphia76ers": {"category": "official_nba_team", "franchise": "Philadelphia 76ers", "competition": "NBA"},
+    "sixers": {"category": "official_nba_team", "franchise": "Philadelphia 76ers", "competition": "NBA"},
+    "dallasmavericks": {"category": "official_nba_team", "franchise": "Dallas Mavericks", "competition": "NBA"},
+    "mavs": {"category": "official_nba_team", "franchise": "Dallas Mavericks", "competition": "NBA"},
+    "laclippers": {"category": "official_nba_team", "franchise": "Los Angeles Clippers", "competition": "NBA"},
+    "clippers": {"category": "official_nba_team", "franchise": "Los Angeles Clippers", "competition": "NBA"},
+    "memphisgrizzlies": {"category": "official_nba_team", "franchise": "Memphis Grizzlies", "competition": "NBA"},
+    "grizzlies": {"category": "official_nba_team", "franchise": "Memphis Grizzlies", "competition": "NBA"},
+    "pelicans": {"category": "official_nba_team", "franchise": "New Orleans Pelicans", "competition": "NBA"},
+    "hornets": {"category": "official_nba_team", "franchise": "Charlotte Hornets", "competition": "NBA"},
+    "utahjazz": {"category": "official_nba_team", "franchise": "Utah Jazz", "competition": "NBA"},
+    "orlandomagic": {"category": "official_nba_team", "franchise": "Orlando Magic", "competition": "NBA"},
+    "okcthunder": {"category": "official_nba_team", "franchise": "Oklahoma City Thunder", "competition": "NBA"},
+    "wizards": {"category": "official_nba_team", "franchise": "Washington Wizards", "competition": "NBA"},
+    "suns": {"category": "official_nba_team", "franchise": "Phoenix Suns", "competition": "NBA"},
+    "kings": {"category": "official_nba_team", "franchise": "Sacramento Kings", "competition": "NBA"},
+    "brooklynnets": {"category": "official_nba_team", "franchise": "Brooklyn Nets", "competition": "NBA"},
+    "hawks": {"category": "official_nba_team", "franchise": "Atlanta Hawks", "competition": "NBA"},
+    "houstonrockets": {"category": "official_nba_team", "franchise": "Houston Rockets", "competition": "NBA"},
+    "rockets": {"category": "official_nba_team", "franchise": "Houston Rockets", "competition": "NBA"},
+    "nyknicks": {"category": "official_nba_team", "franchise": "New York Knicks", "competition": "NBA"},
+    "bucks": {"category": "official_nba_team", "franchise": "Milwaukee Bucks", "competition": "NBA"},
+
+    # Verified NBA-focused media & fan communities
+    "heatnation": {"category": "nba_focused_media", "franchise": "Miami Heat", "competition": "NBA"},
+    "8points9seconds": {"category": "nba_focused_media", "franchise": "Indiana Pacers", "competition": "NBA"},
+    "raptorsnation": {"category": "nba_focused_media", "franchise": "Toronto Raptors", "competition": "NBA"},
+    "raptorsrepublic": {"category": "nba_focused_media", "franchise": "Toronto Raptors", "competition": "NBA"},
+    "airalamo": {"category": "nba_focused_media", "franchise": "San Antonio Spurs", "competition": "NBA"},
+    "detroitbadboys": {"category": "nba_focused_media", "franchise": "Detroit Pistons", "competition": "NBA"},
+    "fearthesword": {"category": "nba_focused_media", "franchise": "Cleveland Cavaliers", "competition": "NBA"},
+    "blazersedge": {"category": "nba_focused_media", "franchise": "Portland Trail Blazers", "competition": "NBA"},
+    "libertyballers": {"category": "nba_focused_media", "franchise": "Philadelphia 76ers", "competition": "NBA"},
+    "celticsblog": {"category": "nba_focused_media", "franchise": "Boston Celtics", "competition": "NBA"},
+    "goldenstateofmind": {"category": "nba_focused_media", "franchise": "Golden State Warriors", "competition": "NBA"},
+    "bluemanhoop": {"category": "nba_focused_media", "franchise": "Golden State Warriors", "competition": "NBA"},
+    "clutchpoints": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "basketballforever": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "hoopsrumors": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "hoopshype": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "nbamaniacs": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "slammagazine": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "lakersnation": {"category": "nba_focused_media", "franchise": "Los Angeles Lakers", "competition": "NBA"},
+    "lakeshowlife": {"category": "nba_focused_media", "franchise": "Los Angeles Lakers", "competition": "NBA"},
+    "hardwoodhoudini33": {"category": "nba_focused_media", "franchise": "Boston Celtics", "competition": "NBA"},
+    "thesmokingcuban": {"category": "nba_focused_media", "franchise": "Dallas Mavericks", "competition": "NBA"},
+    "thunderousintentions": {"category": "nba_focused_media", "franchise": "Oklahoma City Thunder", "competition": "NBA"},
+    "nuggetslove": {"category": "nba_focused_media", "franchise": "Denver Nuggets", "competition": "NBA"},
+    "denverstiffs": {"category": "nba_focused_media", "franchise": "Denver Nuggets", "competition": "NBA"},
+    "pippenainteasyfs": {"category": "nba_focused_media", "franchise": "Chicago Bulls", "competition": "NBA"},
+    "dailyknicks": {"category": "nba_focused_media", "franchise": "New York Knicks", "competition": "NBA"},
+    "fansidedkjg": {"category": "nba_focused_media", "franchise": "Cleveland Cavaliers", "competition": "NBA"},
+    "sixersense": {"category": "nba_focused_media", "franchise": "Philadelphia 76ers", "competition": "NBA"},
+    "ripcityproject": {"category": "nba_focused_media", "franchise": "Portland Trail Blazers", "competition": "NBA"},
+    "thejnotes": {"category": "nba_focused_media", "franchise": "Utah Jazz", "competition": "NBA"},
+    "slcdunkfb": {"category": "nba_focused_media", "franchise": "Utah Jazz", "competition": "NBA"},
+    "valleyofthesuns": {"category": "nba_focused_media", "franchise": "Phoenix Suns", "competition": "NBA"},
+    "behindthebuckpass": {"category": "nba_focused_media", "franchise": "Milwaukee Bucks", "competition": "NBA"},
+    "orlandomagicdaily": {"category": "nba_focused_media", "franchise": "Orlando Magic", "competition": "NBA"},
+    "peachtreehoops": {"category": "nba_focused_media", "franchise": "Atlanta Hawks", "competition": "NBA"},
+    "canishoopussbn": {"category": "nba_focused_media", "franchise": "Minnesota Timberwolves", "competition": "NBA"},
+    "nbavietnam": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "basketusa": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "trashtalk.fr": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "basketsession": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "parlonsbasketnba": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "bebasket.nba": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "insidebasket": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "nbamexico": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "nbalatam": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "hispanosnba": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "gigantesdelbasket": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "nbabrasil": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "bolapresa": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "jumperbrasil": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "nbapassioncom": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "nbareligion": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "dunkestfantasybasketball": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "nbajapan": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "nba.taiwan": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "nbaindonesia": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "nbaliveinthailand": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+    "nbaarabic": {"category": "nba_focused_media", "franchise": None, "competition": "NBA"},
+
+    # General Basketball / Non-NBA
+    "onesportsphl": {"category": "general_sports_philippines", "default_competition": "UAAP/PBA"},
+    "fiba": {"category": "general_basketball", "default_competition": "FIBA"},
+    "vba": {"category": "general_basketball", "default_competition": "VBA"},
+    "euroleague": {"category": "general_basketball", "default_competition": "EuroLeague"},
+}
+
+
+def classify_nba_post(text, sport_hint=None, author_or_source=None, policy="contextual"):
+    """Classifies whether a post caption belongs strictly to the NBA competition scope.
+
+    Supports two policy modes:
+      - 'contextual' (recommended): leverages verified official NBA teams/leagues & dedicated NBA media
+        sources to classify genuine team content (e.g. 'Back to work 🏀🔥', 'Half.', 'Onto the regular season we go').
+      - 'strict': requires explicit NBA franchise, player, or league keywords directly in caption text.
+
+    Returns:
+        dict with:
+            matched (bool): True if verified NBA evidence exists and satisfies policies.
+            status (str): 'matched' | 'unmatched' | 'uncertain'.
+            sport_category (str or None): 'Basketball' or None.
+            competition (str or None): 'NBA', detected other league, or None.
+            rule_score (float): rule-based score (1.0 = direct evidence, 0.5 = uncertain, 0.0 = unmatched).
+            confidence (str): 'high' | 'medium' | 'low'.
+            evidence (list[str]): matched tokens supporting classification.
+            reason (str): human-readable rationale.
+            policy_note (str): policy explanation.
+            classification_basis (str): 'text_evidence' | 'verified_source_context' | 'verified_media_context' | 'unidentified'
+    """
+    if not text or not str(text).strip():
+        return {
+            "matched": False,
+            "status": "uncertain",
+            "sport_category": None,
+            "competition": None,
+            "rule_score": 0.0,
+            "confidence": "low",
+            "evidence": [],
+            "reason": "no_caption_or_media_only",
+            "policy_note": "Post caption is required for research dataset inclusion",
+            "classification_basis": "unidentified",
+        }
+
+    clean_text = str(text).strip()
+    alphanumeric = re.sub(r"[\s\W\d_]+", "", clean_text)
+    if len(alphanumeric) < 4:
+        return {
+            "matched": False,
+            "status": "uncertain",
+            "sport_category": "Basketball" if (sport_hint and "basket" in str(sport_hint).lower()) else None,
+            "competition": None,
+            "rule_score": 0.0,
+            "confidence": "low",
+            "evidence": [],
+            "reason": "insufficient_text_content_or_emoji_only",
+            "policy_note": "Minimal or emoji-only text lacks sufficient substantive evidence",
+            "classification_basis": "unidentified",
+        }
+
+    # Resolve canonical author / source context from registry
+    canonical_source = None
+    source_info = None
+    if author_or_source:
+        s_clean = str(author_or_source).strip()
+        m_profile = re.search(r"facebook\.com/(?:pages/[^/]+/|profile\.php\?id=)?([^/?#]+)", s_clean, re.IGNORECASE)
+        candidate_handle = m_profile.group(1).lower() if m_profile else s_clean.lower()
+        candidate_handle = candidate_handle.rstrip("/")
+        if candidate_handle in NBA_SOURCE_REGISTRY:
+            canonical_source = candidate_handle
+            source_info = NBA_SOURCE_REGISTRY[candidate_handle]
+        else:
+            simp = re.sub(r"[\s\W_]+", "", candidate_handle)
+            if simp in NBA_SOURCE_REGISTRY:
+                canonical_source = simp
+                source_info = NBA_SOURCE_REGISTRY[simp]
+
+    # 1. Non-NBA competition detection
+    detected_non_nba = []
+    for comp_name, comp_pat in NON_NBA_COMPETITION_RULES.items():
+        matches = comp_pat.findall(clean_text)
+        if matches:
+            detected_non_nba.append((comp_name, list(dict.fromkeys(m.lower() for m in matches))))
+
+    # 2. NBA evidence detection
+    nba_explicit = NBA_EXPLICIT_RULE.findall(clean_text)
+    nba_teams = NBA_TEAMS_RULE.findall(clean_text)
+    nba_persons = NBA_PERSONS_RULE.findall(clean_text)
+    bball_actions = BASKETBALL_ACTION_RULE.findall(clean_text)
+
+    # Clean evidence lists
+    exp_tokens = list(dict.fromkeys(m.lower() for m in nba_explicit))
+    team_tokens = list(dict.fromkeys(m.lower() for m in nba_teams))
+    person_tokens = list(dict.fromkeys(m.lower() for m in nba_persons))
+    action_tokens = list(dict.fromkeys(m.lower() for m in bball_actions))
+
+    all_nba_evidence = list(dict.fromkeys(exp_tokens + team_tokens + person_tokens))
+
+    # Evaluate non-NBA competition conflicts
+    if detected_non_nba:
+        primary_comp, comp_tokens = detected_non_nba[0]
+        if primary_comp == "UAAP":
+            return {
+                "matched": False,
+                "status": "unmatched",
+                "sport_category": "Basketball",
+                "competition": "UAAP",
+                "rule_score": 0.0,
+                "confidence": "high",
+                "evidence": comp_tokens,
+                "reason": "uaap_collegiate_basketball_excluded",
+                "policy_note": "Philippine UAAP collegiate basketball is excluded from NBA dataset scope",
+                "classification_basis": "text_evidence",
+            }
+        if primary_comp == "NBA2K":
+            return {
+                "matched": False,
+                "status": "unmatched",
+                "sport_category": "Basketball",
+                "competition": "NBA2K",
+                "rule_score": 0.0,
+                "confidence": "high",
+                "evidence": comp_tokens,
+                "reason": "esports_video_game_excluded",
+                "policy_note": "NBA 2K esports/video game content is excluded by project policy",
+                "classification_basis": "text_evidence",
+            }
+        if primary_comp == "GLeague":
+            return {
+                "matched": False,
+                "status": "unmatched",
+                "sport_category": "Basketball",
+                "competition": "GLeague",
+                "rule_score": 0.0,
+                "confidence": "high",
+                "evidence": comp_tokens,
+                "reason": "development_league_excluded",
+                "policy_note": "NBA G-League development content is excluded from main NBA scope",
+                "classification_basis": "text_evidence",
+            }
+        if not all_nba_evidence:
+            return {
+                "matched": False,
+                "status": "unmatched",
+                "sport_category": "Basketball",
+                "competition": primary_comp,
+                "rule_score": 0.0,
+                "confidence": "high",
+                "evidence": comp_tokens,
+                "reason": f"non_nba_competition_detected ({primary_comp})",
+                "policy_note": f"Content focuses exclusively on {primary_comp}, not NBA",
+                "classification_basis": "text_evidence",
+            }
+        # Both NBA evidence and other league mentioned (e.g. NBA player in FIBA/Olympics or NCAA draft)
+        if person_tokens or team_tokens:
+            return {
+                "matched": True,
+                "status": "matched",
+                "sport_category": "Basketball",
+                "competition": "NBA",
+                "secondary_competition": primary_comp,
+                "rule_score": 0.8,
+                "confidence": "medium",
+                "evidence": all_nba_evidence[:5] + comp_tokens[:3],
+                "reason": f"nba_player_or_team_in_international_or_draft_context ({primary_comp})",
+                "policy_note": f"NBA entity is subject of post mentioning {primary_comp}",
+                "classification_basis": "text_evidence",
+            }
+        mixed_ev = list(dict.fromkeys(all_nba_evidence + comp_tokens))
+        return {
+            "matched": False,
+            "status": "uncertain",
+            "sport_category": "Basketball",
+            "competition": f"Mixed ({primary_comp} + NBA)",
+            "rule_score": 0.5,
+            "confidence": "medium",
+            "evidence": mixed_ev[:10],
+            "reason": "mixed_competitions_insufficient_evidence",
+            "policy_note": "Post contains mixed league references without unambiguous single-competition focus",
+            "classification_basis": "text_evidence",
+        }
+
+    # 3. Validated NBA evidence in text
+    if all_nba_evidence:
+        promo_matches = COMMERCIAL_PROMO_RULE.findall(clean_text)
+        has_game_context = bool(action_tokens) or any(
+            t in clean_text.lower() for t in ["vs", "game", "score", "pts", "highlights", "win", "loss", "points", "season", "trade", "playoffs"]
+        )
+        hiring_matches = [p for p in promo_matches if p.lower() in {"we are hiring", "apply now", "job vacancy", "job opening", "tuyển dụng"}]
+        if hiring_matches and not has_game_context:
+            return {
+                "matched": False,
+                "status": "uncertain",
+                "sport_category": "Basketball",
+                "competition": "NBA",
+                "rule_score": 0.5,
+                "confidence": "low",
+                "content_type": "recruitment",
+                "evidence": all_nba_evidence[:5] + [h.lower() for h in hiring_matches],
+                "reason": "recruitment_or_administrative_content",
+                "policy_note": "Administrative hiring without game context is flagged for review",
+                "classification_basis": "text_evidence",
+            }
+
+        if promo_matches and not has_game_context:
+            return {
+                "matched": True,
+                "status": "matched",
+                "sport_category": "Basketball",
+                "competition": "NBA",
+                "rule_score": 0.8,
+                "confidence": "medium",
+                "content_type": "commercial_or_promo",
+                "evidence": all_nba_evidence[:5] + [p.lower() for p in promo_matches[:3]],
+                "reason": "nba_commercial_or_merchandise_content",
+                "policy_note": "Commercial or ticket announcement related to NBA team/franchise",
+                "classification_basis": "text_evidence",
+            }
+
+        return {
+            "matched": True,
+            "status": "matched",
+            "sport_category": "Basketball",
+            "competition": "NBA",
+            "rule_score": 1.0,
+            "confidence": "high",
+            "evidence": all_nba_evidence[:10],
+            "reason": "matched_nba_evidence",
+            "policy_note": "Direct verified NBA franchise, player, or league token matched",
+            "classification_basis": "text_evidence",
+        }
+
+    # 4. Contextual classification via verified NBA source registry
+    if policy == "contextual" and source_info:
+        cat = source_info.get("category")
+        if cat in ("official_nba", "official_nba_team"):
+            return {
+                "matched": True,
+                "status": "matched",
+                "sport_category": "Basketball",
+                "competition": "NBA",
+                "rule_score": 1.0,
+                "confidence": "high",
+                "evidence": [f"source:{canonical_source}"] + action_tokens[:5],
+                "reason": f"verified_official_nba_team_source ({canonical_source})",
+                "policy_note": "Post published by verified official NBA team / league with no conflicting competition evidence",
+                "classification_basis": "verified_source_context",
+            }
+        elif cat == "nba_focused_media":
+            if action_tokens or (sport_hint and "basket" in str(sport_hint).lower()):
+                return {
+                    "matched": True,
+                    "status": "matched",
+                    "sport_category": "Basketball",
+                    "competition": "NBA",
+                    "rule_score": 0.9,
+                    "confidence": "high",
+                    "evidence": action_tokens[:5] or [f"source:{canonical_source}"],
+                    "reason": f"verified_nba_focused_media ({canonical_source}) with basketball content",
+                    "policy_note": "Post from verified NBA-focused media outlet covering basketball topics",
+                    "classification_basis": "verified_media_context",
+                }
+            else:
+                return {
+                    "matched": False,
+                    "status": "uncertain",
+                    "sport_category": "Basketball",
+                    "competition": "NBA",
+                    "rule_score": 0.5,
+                    "confidence": "medium",
+                    "evidence": [f"source:{canonical_source}"],
+                    "reason": "insufficient_nba_evidence_needs_review",
+                    "policy_note": "Post from NBA-focused media but caption lacks distinct game/basketball tokens",
+                    "classification_basis": "verified_media_context",
+                }
+
+    # 5. Generic Basketball terms without specific NBA evidence
+    if action_tokens or re.search(r"(\b(basketball|bóng rổ)\b|🏀)", clean_text, re.IGNORECASE):
+        bball_ev = action_tokens or (["🏀"] if "🏀" in clean_text else ["basketball"])
+        if sport_hint and "basket" in str(sport_hint).lower():
+            return {
+                "matched": False,
+                "status": "uncertain",
+                "sport_category": "Basketball",
+                "competition": None,
+                "rule_score": 0.5,
+                "confidence": "medium",
+                "evidence": bball_ev[:5],
+                "reason": "basketball_detected_but_lacks_distinct_nba_evidence",
+                "policy_note": "Basketball action detected but specific NBA franchise/player evidence is missing",
+                "classification_basis": "text_evidence",
+            }
+        return {
+            "matched": False,
+            "status": "unmatched",
+            "sport_category": "Basketball",
+            "competition": None,
+            "rule_score": 0.0,
+            "confidence": "low",
+            "evidence": bball_ev[:5],
+            "reason": "basketball_detected_outside_nba_scope",
+            "policy_note": "Generic basketball without source hint or NBA evidence",
+            "classification_basis": "text_evidence",
+        }
+
+    # 6. Non-sport content
+    return {
+        "matched": False,
+        "status": "unmatched",
+        "sport_category": None,
+        "competition": None,
+        "rule_score": 0.0,
+        "confidence": "high",
+        "evidence": [],
+        "reason": "no_basketball_or_nba_evidence",
+        "policy_note": "Content contains no recognized basketball or NBA tokens",
+        "classification_basis": "unidentified",
+    }
+
+
+def evaluate_record_acceptance(record, tech_meta=None, target_sport="Basketball", target_competition="NBA"):
+    """Evaluates whether a dataset record meets all strict quality criteria for inclusion
+    in the final research dataset.
+
+    Returns:
+        (is_accepted: bool, rejection_reasons: list[str])
+    """
+    reasons = []
+    if not record.get("post_id"):
+        reasons.append("missing_post_id")
+    if not record.get("post_url"):
+        reasons.append("missing_post_url")
+    if record.get("media_type") == "video":
+        reasons.append("video_post_omitted_by_policy")
+    if not record.get("text") or not str(record.get("text")).strip():
+        reasons.append("missing_caption_text")
+    if not record.get("published_at"):
+        reasons.append("missing_published_at")
+    if not record.get("collected_at"):
+        reasons.append("missing_collected_at")
+
+    # Target competition evaluation
+    nba_meta = {}
+    if tech_meta and "nba_classification" in tech_meta:
+        nba_meta = tech_meta["nba_classification"]
+    elif tech_meta and "sport_classification" in tech_meta and isinstance(tech_meta["sport_classification"], dict):
+        nba_meta = tech_meta["sport_classification"].get("nba_classification") or {}
+
+    if target_competition == "NBA":
+        status = nba_meta.get("status")
+        if status != "matched":
+            reasons.append(f"nba_competition_not_matched (status: {status}, reason: {nba_meta.get('reason')})")
+
+    # Sport category evaluation
+    sport = record.get("sport_category") or ""
+    # If NBA matched, ensure sport category is recognized as Basketball
+    if nba_meta.get("matched") and not sport:
+        sport = "Basketball"
+        record["sport_category"] = "Basketball"
+
+    if target_sport:
+        clean_target = target_sport.strip().lower()
+        sports_in_rec = [s.strip().lower() for s in sport.split(",") if s.strip()]
+        if clean_target not in sports_in_rec:
+            reasons.append(f"sport_category_mismatch (got '{sport}', expected '{target_sport}')")
+
+    like_count = record.get("like_count")
+    if like_count is None or not isinstance(like_count, int) or like_count < 0:
+        reasons.append("missing_or_invalid_like_count")
+
+    is_accepted = (len(reasons) == 0)
+    return is_accepted, reasons
+
 
 def classify_post_sport(text, sport_hint=None, media_type="text"):
     """Classifies the sport category of an individual post strictly based on its own evidence.
@@ -706,7 +1319,8 @@ def classify_post_sport(text, sport_hint=None, media_type="text"):
             "evidence": [],
             "sport_hint": clean_hint,
             "detected_sports": [],
-            "confidence": None,
+            "rule_score": 0.0,
+            "confidence": "low",
             "reason": "No text content available to infer sport",
         }
     
@@ -721,7 +1335,8 @@ def classify_post_sport(text, sport_hint=None, media_type="text"):
             "evidence": [],
             "sport_hint": clean_hint,
             "detected_sports": [],
-            "confidence": None,
+            "rule_score": 0.0,
+            "confidence": "low",
             "reason": "Caption contains only emojis/symbols without text evidence",
         }
 
@@ -734,16 +1349,33 @@ def classify_post_sport(text, sport_hint=None, media_type="text"):
             detected_sports.append(sport_name)
             evidence.extend([m.lower() for m in matches if m.lower() not in evidence])
 
+    # Filter spurious multi-sport cross-talk:
+    # If Basketball is detected, remove Athletics if only generic running/runner matched,
+    # and remove Shooting if only target shooting pattern without target sport context matched.
+    if "Basketball" in detected_sports and len(detected_sports) > 1:
+        if "Athletics" in detected_sports:
+            ath_words = {"running", "runner", "chạy bộ"}
+            ath_ev = [e for e in evidence if e in ath_words]
+            distinct_ath = [e for e in evidence if e not in ath_words and e in {"athletics", "điền kinh", "marathon", "maratón", "maratona", "half marathon", "bán marathon", "10k", "21k", "42k", "atletismo", "world athletics", "rfea"}]
+            if ath_ev and not distinct_ath:
+                detected_sports.remove("Athletics")
+        if "Shooting" in detected_sports:
+            distinct_shooting = [e for e in evidence if e in {"target shooting", "sport shooting", "bắn súng thể thao", "xạ thủ", "issf", "10m air rifle", "50m rifle"}]
+            if not distinct_shooting:
+                detected_sports.remove("Shooting")
+
     if detected_sports:
         canonical_str = ", ".join(detected_sports)
         method = "multi_sport_keyword_match" if len(detected_sports) > 1 else "rule_keyword_match"
+        rule_score = 1.0 if len(detected_sports) == 1 else 0.8
         return canonical_str, {
             "status": "classified",
             "classification_method": method,
             "evidence": evidence[:10],
             "sport_hint": clean_hint,
             "detected_sports": detected_sports,
-            "confidence": 0.95,
+            "rule_score": rule_score,
+            "confidence": "rule_based_high" if rule_score >= 1.0 else "rule_based_medium",
             "reason": f"Matched rules for {canonical_str}",
         }
 
@@ -756,7 +1388,8 @@ def classify_post_sport(text, sport_hint=None, media_type="text"):
             "evidence": [m.lower() for m in non_sport_matches[:5]],
             "sport_hint": clean_hint,
             "detected_sports": [],
-            "confidence": 0.9,
+            "rule_score": 0.9,
+            "confidence": "rule_based_high",
             "reason": "Content indicates non-sports announcement",
         }
 
@@ -767,7 +1400,8 @@ def classify_post_sport(text, sport_hint=None, media_type="text"):
         "evidence": [],
         "sport_hint": clean_hint,
         "detected_sports": [],
-        "confidence": None,
+        "rule_score": 0.0,
+        "confidence": "low",
         "reason": "Content has no clear sport-related keywords or evidence",
     }
 
@@ -909,25 +1543,88 @@ def extract_author_id(url, page=None):
     return None
 
 
-def detect_language(text):
-    """Detects text language ('vi', 'es', 'en', or 'unknown').
-    Falls back to 'unknown' rather than blindly defaulting Latin to 'en'.
+def detect_language_with_meta(text):
+    """Statistical offline language detector using lingua-language-detector.
+    Returns:
+        (lang_code: str, metadata: dict)
     """
     if not text:
-        return "unknown"
+        return "unknown", {
+            "status": "unknown",
+            "method": "lingua_statistical",
+            "version": "2.2.0",
+            "reason": "empty_text",
+            "confidence": 0.0,
+            "candidates": []
+        }
+
+    clean = re.sub(r"https?://\S+", "", str(text))
+    clean = re.sub(r"@\w+", "", clean)
+    clean = re.sub(r"#(\w+)", r"\1", clean)
+    alpha = re.sub(r"[\s\W\d_]+", "", clean)
+    if len(alpha) < 4:
+        return "unknown", {
+            "status": "unknown",
+            "method": "lingua_statistical",
+            "version": "2.2.0",
+            "reason": "text_too_short_or_emoji_only",
+            "confidence": 0.0,
+            "candidates": []
+        }
+
+    detector = _get_lingua_detector()
+    if detector is not None:
+        try:
+            confs = detector.compute_language_confidence_values(clean)
+            if confs:
+                c0 = confs[0]
+                c1 = confs[1] if len(confs) > 1 else None
+                margin = c0.value - (c1.value if c1 else 0.0)
+                top_code = LINGUA_LANG_MAP.get(c0.language.name, "unknown")
+                candidates = [[LINGUA_LANG_MAP.get(c.language.name, c.language.name.lower()), round(c.value, 3)] for c in confs[:3]]
+                # Calibrated thresholds based on text length and candidate margin
+                words = clean.split()
+                is_short = len(words) < 5 or len(clean) < 30
+                if is_short:
+                    is_confident = (c0.value >= 0.65 and margin >= 0.20)
+                else:
+                    is_confident = (c0.value >= 0.50 and margin >= 0.10)
+
+                if is_confident and top_code != "unknown":
+                    return top_code, {
+                        "status": "detected",
+                        "method": "lingua_statistical",
+                        "version": "2.2.0",
+                        "language": top_code,
+                        "confidence": round(c0.value, 3),
+                        "margin": round(margin, 3),
+                        "candidates": candidates,
+                        "reason": "high_confidence"
+                    }
+                else:
+                    return "unknown", {
+                        "status": "unknown",
+                        "method": "lingua_statistical",
+                        "version": "2.2.0",
+                        "reason": "low_confidence_or_ambiguous",
+                        "confidence": round(c0.value, 3),
+                        "margin": round(margin, 3),
+                        "candidates": candidates
+                    }
+        except Exception as exc:
+            logger.debug(f"lingua detection error: {exc}")
+
+    # Fallback to heuristic
     words = [w.lower() for w in re.findall(r"\b\w+\b", text)]
     if not words:
-        return "unknown"
-
-    # Vietnamese check
+        return "unknown", {"status": "unknown", "method": "heuristic_fallback", "reason": "no_words"}
     vn_word_count = sum(1 for w in words if w in COMMON_VN_WORDS)
     if vn_word_count >= 2:
-        return "vi"
+        return "vi", {"status": "detected", "method": "heuristic_fallback", "language": "vi"}
     vn_chars = len(VIETNAMESE_DISTINCT_RE.findall(text))
     if vn_chars >= 3 and (vn_word_count >= 1 or vn_chars / len(text) > 0.02):
-        return "vi"
+        return "vi", {"status": "detected", "method": "heuristic_fallback", "language": "vi"}
 
-    # Multi-language scoring: Spanish vs French vs English
     es_score = sum(1 for w in words if w in COMMON_ES_WORDS)
     fr_score = sum(1 for w in words if w in COMMON_FR_WORDS)
     en_score = sum(1 for w in words if w in COMMON_EN_WORDS)
@@ -938,19 +1635,21 @@ def detect_language(text):
     second_lang, second_score = scores[1]
 
     if top_score >= 2 and top_score > second_score:
-        return top_lang
-
-    # Secondary check with accent clues
+        return top_lang, {"status": "detected", "method": "heuristic_fallback", "language": top_lang}
     if fr_score >= 1 and re.search(r"[éèêëàâùûçœîï]", text.lower()):
-        return "fr"
+        return "fr", {"status": "detected", "method": "heuristic_fallback", "language": "fr"}
     if es_score >= 1 and re.search(r"[áíóúñ¿¡]", text.lower()):
-        return "es"
-    if re.search(r"[¿¡]", text):
-        return "es"
+        return "es", {"status": "detected", "method": "heuristic_fallback", "language": "es"}
     if en_score >= 2:
-        return "en"
+        return "en", {"status": "detected", "method": "heuristic_fallback", "language": "en"}
 
-    return "unknown"
+    return "unknown", {"status": "unknown", "method": "heuristic_fallback", "reason": "insufficient_word_score"}
+
+
+def detect_language(text):
+    """Detects text language ('en', 'vi', 'es', 'fr', 'pt', 'tl', or 'unknown')."""
+    lang_code, _ = detect_language_with_meta(text)
+    return lang_code
 
 
 def extract_hashtags(text):
@@ -1002,24 +1701,45 @@ def build_dataset_record(
     """Builds a standardized 17-column dataset record with exact schema compliance."""
     final_post_id = post_id or extract_post_id(post_url)
     final_author_id = author_id or extract_author_id(post_url)
-    final_collected_at = collected_at or datetime.now(timezone.utc).isoformat()
-    final_language = language or detect_language(text)
-    final_hashtags = hashtags if hashtags is not None else extract_hashtags(text)
-    if mentions is not None:
-        cleaned_list = []
-        for m in mentions:
-            if not m:
-                continue
-            m_str = str(m).strip()
-            if not m_str.startswith("@"):
-                m_str = "@" + m_str
-            cleaned = m_str.rstrip(".,;:!?")
-            if len(cleaned) > 1 and cleaned not in cleaned_list:
-                cleaned_list.append(cleaned)
-        final_mentions = cleaned_list
+
+    # Standardize collected_at to Asia/Ho_Chi_Minh (+07:00)
+    if collected_at:
+        try:
+            dt = datetime.fromisoformat(str(collected_at).replace("Z", "+00:00"))
+            final_collected_at = dt.astimezone(VIETNAM_TZ).isoformat()
+        except Exception:
+            final_collected_at = str(collected_at)
     else:
-        final_mentions = extract_mentions(text)
+        final_collected_at = datetime.now(VIETNAM_TZ).isoformat()
+
     final_media_type = media_type or "text"
+
+    # For video posts, omit caption text, language, hashtags, mentions, and sport due to video player DOM quirks
+    if final_media_type == "video":
+        final_text = None
+        final_language = None
+        final_hashtags = []
+        final_mentions = []
+        final_sport_category = None
+    else:
+        final_text = text
+        final_language = language or detect_language(text)
+        final_hashtags = hashtags if hashtags is not None else extract_hashtags(text)
+        if mentions is not None:
+            cleaned_list = []
+            for m in mentions:
+                if not m:
+                    continue
+                m_str = str(m).strip()
+                if not m_str.startswith("@"):
+                    m_str = "@" + m_str
+                cleaned = m_str.rstrip(".,;:!?")
+                if len(cleaned) > 1 and cleaned not in cleaned_list:
+                    cleaned_list.append(cleaned)
+            final_mentions = cleaned_list
+        else:
+            final_mentions = extract_mentions(text)
+        final_sport_category = validate_or_normalize_sport(sport_category)
 
     # View count represents total views/impressions across post types (if displayed)
     final_view_count = parse_numeric_count(view_count)
@@ -1027,7 +1747,7 @@ def build_dataset_record(
     record = {
         "post_id": str(final_post_id) if final_post_id is not None else None,
         "platform": "Facebook",
-        "text": text,
+        "text": final_text,
         "published_at": published_at,
         "collected_at": final_collected_at,
         "author_id": str(final_author_id) if final_author_id is not None else None,
@@ -1041,7 +1761,7 @@ def build_dataset_record(
         "media_type": final_media_type,
         "author_followers": parse_numeric_count(author_followers),
         "post_url": post_url,
-        "sport_category": validate_or_normalize_sport(sport_category),
+        "sport_category": final_sport_category,
     }
 
     assert list(record.keys()) == REQUIRED_COLUMNS, "Column mismatch in dataset record!"
@@ -1424,10 +2144,12 @@ SCOPED_EXTRACTION_JS = r"""(postUrl) => {
     }
 
     // 5. Metrics
-    // 5.0 Compact metric summary row: e.g. "44\n2\n6" or "44\n2"
-    const metricDivs = Array.from(card.querySelectorAll('div')).filter(d => 
-        /^\d[\d.,]*[KkMmB]?\n\d[\d.,]*[KkMmB]?(\n\d[\d.,]*[KkMmB]?)?$/.test((d.innerText || '').trim())
-    );
+    // 5.0 Compact metric summary row: e.g. "44\n2\n6" or "44\n2" (only outside caption/comments)
+    const metricDivs = Array.from(card.querySelectorAll('div')).filter(d => {
+        if (d.closest('div[data-ad-preview="message"], div[data-ad-comet-preview="message"]')) return false;
+        if (d.closest('ul, [role="article"] [role="article"]')) return false;
+        return /^\d[\d.,]*[KkMmB]?\n\d[\d.,]*[KkMmB]?(\n\d[\d.,]*[KkMmB]?)?$/.test((d.innerText || '').trim());
+    });
     if (metricDivs.length > 0) {
         const parts = metricDivs[0].innerText.trim().split('\n').map(s => s.trim());
         if (parts.length >= 1 && !res.like_count_raw) res.like_count_raw = parts[0];
@@ -1465,9 +2187,53 @@ SCOPED_EXTRACTION_JS = r"""(postUrl) => {
         if (sMatch) res.share_count_raw = sMatch[1];
     }
 
-    // 5.4 Views
-    const vMatch = cardText.match(/\b(\d[\d.,]*[KkMmB]?)\s+(?:views?|lượt xem|reproducciones)\b/i);
-    if (vMatch) res.view_count_raw = vMatch[1];
+    // 5.4 Views: Verified Metric Candidates Only (default null, exclude command verbs & caption text)
+    res.view_count_raw = null;
+    res.view_candidates = [];
+    res.view_status = "not_displayed";
+
+    const isInvalidViewCommand = (str) => {
+        if (!str) return true;
+        const s = str.trim();
+        return /^(?:view|xem|ver)\s+(?:profile|more|trang cá nhân|thêm|replies|câu trả lời|bình luận|comments|photos?|ảnh|videos?|history|insights|posts?)/i.test(s) ||
+               /(?:more\s+comments|replies|câu trả lời|bình luận\s+khác)$/i.test(s) ||
+               /target\s+is\s+\d+\s+views/i.test(s);
+    };
+
+    const viewMetricRegex = /^(?:([\d.,]+[KkMmB]?|\d+\s*(?:nghìn|ngàn|triệu|tr|mil|millones))\s+(?:views?|lượt xem|reproducciones))$/i;
+
+    const candidateEls = Array.from(card.querySelectorAll('span, div, [role="button"], a')).filter(el => {
+        if (el.closest('div[data-ad-preview="message"], div[data-ad-comet-preview="message"]')) return false;
+        if (el.closest('ul, [role="article"] [role="article"]')) return false;
+        const aria = (el.getAttribute('aria-label') || '').trim();
+        const txt = (el.innerText || '').trim();
+        if (isInvalidViewCommand(aria) || isInvalidViewCommand(txt)) return false;
+        return viewMetricRegex.test(aria) || viewMetricRegex.test(txt);
+    });
+
+    for (const el of candidateEls) {
+        const aria = (el.getAttribute('aria-label') || '').trim();
+        const txt = (el.innerText || '').trim();
+        const m = aria.match(viewMetricRegex) || txt.match(viewMetricRegex);
+        if (m) {
+            res.view_candidates.push({
+                raw: m[1],
+                label: aria || txt,
+                tag: el.tagName.toLowerCase()
+            });
+        }
+    }
+
+    if (res.view_candidates.length > 0) {
+        const uniqueCounts = Array.from(new Set(res.view_candidates.map(c => c.raw)));
+        if (uniqueCounts.length === 1) {
+            res.view_count_raw = uniqueCounts[0];
+            res.view_status = "verified";
+        } else {
+            res.view_status = "conflicting_candidates";
+            res.view_count_raw = null;
+        }
+    }
 
     // 6. Media type
     const vids = Array.from(card.querySelectorAll('video')).filter(v => v.clientWidth >= 150 && v.clientHeight >= 150);
@@ -1499,26 +2265,48 @@ SCOPED_EXTRACTION_JS = r"""(postUrl) => {
 };"""
 
 
-def extract_scoped_post_data(page, post_url=None, default_sport=None, reference_tz=VIETNAM_TZ):
+def extract_scoped_post_data(
+    page,
+    post_url=None,
+    default_sport=None,
+    reference_tz=VIETNAM_TZ,
+    nba_policy="contextual",
+    view_policy="verified_only",
+):
     """Extracts post text, metrics, published timestamp, and media scoped strictly to the post container.
     Returns:
         (record_17_col, tech_metadata)
     """
     url = post_url or page.url
-    page_text = ""
-    try:
-        page_text = (page.evaluate("() => document.body.innerText") or "").lower()
-    except Exception:
-        pass
 
-    # Check for deleted/unavailable content
-    if any(term in page_text for term in [
-        "this content isn't available right now",
-        "content not found",
-        "bài viết này không còn hiển thị",
-        "trang này không tồn tại",
-        "este contenido no está disponible",
-    ]):
+    # Check for deleted/unavailable content scoped to main content or heading
+    is_unavailable = False
+    if page is not None and hasattr(page, "evaluate"):
+        try:
+            unavailable_eval = page.evaluate(r'''() => {
+                const errHeading = document.querySelector('h2, h3, [role="heading"]');
+                const hText = errHeading ? (errHeading.innerText || '').toLowerCase() : '';
+                const main = document.querySelector('[role="main"]') || document.body;
+                const mainText = (main.innerText || '').toLowerCase();
+                const phrases = [
+                    "this content isn't available right now",
+                    "content not found",
+                    "bài viết này không còn hiển thị",
+                    "trang này không tồn tại",
+                    "este contenido no está disponible",
+                    "sorry, this content isn't available",
+                    "link you followed may be broken"
+                ];
+                const hasHeadingError = phrases.some(p => hText.includes(p));
+                const hasCard = Boolean(main.querySelector('[role="article"], div[data-ad-preview="message"]'));
+                const hasMainError = !hasCard && phrases.some(p => mainText.includes(p));
+                return hasHeadingError || hasMainError;
+            }''')
+            is_unavailable = bool(unavailable_eval)
+        except Exception:
+            pass
+
+    if is_unavailable:
         tech_meta = {
             "status": "unavailable",
             "review_reasons": ["Post is unavailable, deleted, or restricted by privacy settings."],
@@ -1526,6 +2314,8 @@ def extract_scoped_post_data(page, post_url=None, default_sport=None, reference_
             "time_precision": "insufficient_evidence",
             "is_approximate": {},
             "missing_reasons": {"text": "post_unavailable"},
+            "sport_classification": {"status": "unavailable"},
+            "nba_classification": {"status": "unmatched", "reason": "post_unavailable"},
         }
         record = build_dataset_record(
             post_url=url,
@@ -1534,21 +2324,7 @@ def extract_scoped_post_data(page, post_url=None, default_sport=None, reference_
         )
         return record, tech_meta
 
-    # Pre-expand See more before evaluating DOM
-    if page is not None and hasattr(page, "evaluate"):
-        try:
-            page.evaluate(r'''() => {
-                const btns = Array.from(document.querySelectorAll('[role="button"], span[role="button"], div[role="button"]')).filter(b => {
-                    const t = (b.innerText || '').trim();
-                    return /^(?:see more|xem thêm|ver más|mehr anzeigen|voir plus)$/i.test(t);
-                });
-                btns.forEach(b => { try { b.click(); } catch(e) {} });
-            }''')
-            page.wait_for_timeout(350)
-        except Exception:
-            pass
-
-    # Execute scoped DOM evaluation
+    # Execute scoped DOM evaluation (handles button expansion inside target card)
     try:
         dom_res = page.evaluate(SCOPED_EXTRACTION_JS, url)
     except Exception as exc:
@@ -1597,15 +2373,28 @@ def extract_scoped_post_data(page, post_url=None, default_sport=None, reference_
         comment_val, comment_approx = parse_numeric_count_with_meta(dom_res.get("comment_count_raw"))
 
     share_val, share_approx = parse_numeric_count_with_meta(dom_res.get("share_count_raw"))
-    view_val, view_approx = parse_numeric_count_with_meta(dom_res.get("view_count_raw"))
+
+    # View count: default to None unless verified under verified_only policy
+    view_raw = dom_res.get("view_count_raw")
+    view_status = dom_res.get("view_status", "not_displayed")
+    view_candidates = dom_res.get("view_candidates") or []
+    view_val = None
+    view_approx = False
+
+    if view_policy == "off":
+        view_val = None
+        view_status = "off"
+    elif view_policy == "verified_only" and view_raw and view_status == "verified":
+        view_val, view_approx = parse_numeric_count_with_meta(view_raw)
 
     # Author and post IDs
     page_url = page.url if (page is not None and hasattr(page, "url")) else None
     final_post_id = (extract_post_id(page_url) if page_url else None) or extract_post_id(url)
     final_author_id = (extract_author_id(page_url) if page_url else None) or extract_author_id(url)
 
-    # Sport category classification based strictly on post evidence
-    extracted_text = dom_res.get("text")
+    media_type = dom_res.get("media_type") or "text"
+    extracted_text = None if media_type == "video" else dom_res.get("text")
+
     if extracted_text:
         extracted_text = re.sub(
             r"[\s\n]*…?\s*(?:See more|Xem thêm|Ver más|Mehr anzeigen|Voir plus)\s*$",
@@ -1617,16 +2406,30 @@ def extract_scoped_post_data(page, post_url=None, default_sport=None, reference_
     normalized_sport, sport_meta = classify_post_sport(
         extracted_text,
         sport_hint=default_sport,
-        media_type=dom_res.get("media_type", "text"),
+        media_type=media_type,
     )
+    nba_meta = classify_nba_post(
+        extracted_text,
+        sport_hint=default_sport,
+        author_or_source=final_author_id or url,
+        policy=nba_policy,
+    )
+    if nba_meta.get("matched"):
+        normalized_sport = "Basketball"
+    sport_meta["nba_classification"] = nba_meta
+
+    detected_lang, lang_meta = detect_language_with_meta(extracted_text)
 
     # Compile review reasons and missing field reasons
     review_reasons = list(dom_res.get("review_reasons") or [])
     missing_reasons = {}
 
     if not extracted_text:
-        missing_reasons["text"] = "text_not_found"
-        review_reasons.append("Post caption text could not be extracted.")
+        if media_type == "video":
+            missing_reasons["text"] = "video_text_omitted"
+        else:
+            missing_reasons["text"] = "text_not_found"
+            review_reasons.append("Post caption text could not be extracted.")
     if iso_published is None:
         missing_reasons["published_at"] = time_precision
     if like_val is None:
@@ -1635,17 +2438,15 @@ def extract_scoped_post_data(page, post_url=None, default_sport=None, reference_
         missing_reasons["comment_count"] = "no_comment_count_found"
     if share_val is None:
         missing_reasons["share_count"] = "no_share_count_found"
-    if view_val is None:
-        missing_reasons["view_count"] = "view_count_not_displayed"
     if not normalized_sport:
         missing_reasons["sport_category"] = sport_meta.get("status", "unidentified_sport")
 
     # Status classification
     if not dom_res.get("card_found"):
         status = "needs_review"
-    elif extracted_text and not review_reasons:
+    elif (extracted_text or media_type == "video") and not review_reasons:
         status = "success"
-    elif extracted_text:
+    elif extracted_text or media_type == "video":
         status = "needs_review"
     else:
         status = "failed"
@@ -1663,6 +2464,17 @@ def extract_scoped_post_data(page, post_url=None, default_sport=None, reference_
         },
         "missing_reasons": missing_reasons,
         "sport_classification": sport_meta,
+        "nba_classification": nba_meta,
+        "language_meta": lang_meta,
+        "view_extraction": {
+            "status": view_status,
+            "raw_value": view_raw if view_status == "verified" else None,
+            "normalized_value": view_val,
+            "is_approximate": view_approx,
+            "candidates": view_candidates,
+            "policy": view_policy,
+            "reason": "verified_post_metric" if view_status == "verified" else f"view_{view_status}",
+        },
     }
 
     # Mentions extraction combining regex and DOM tagged anchors
@@ -1676,6 +2488,7 @@ def extract_scoped_post_data(page, post_url=None, default_sport=None, reference_
         author_id=final_author_id,
         post_id=final_post_id,
         sport_category=normalized_sport,
+        language=detected_lang,
         mentions=combined_mentions,
         like_count=like_val,
         comment_count=comment_val,
@@ -1955,12 +2768,33 @@ def extract_feed_card_data(
                 if (cMatch) res.comment_raw = cMatch[1];
                 else if (/no comments yet|chưa có bình luận|sé el primero en comentar/i.test(text)) res.comment_zero = true;
             }
-            if (!res.share_raw) {
-                const sMatch = text.match(/\b(\d[\d.,]*[KkMmB]?)\s+(?:shares?|lượt chia sẻ|veces compartido)\b/i);
-                if (sMatch) res.share_raw = sMatch[1];
+            // Views: Verified Metric Candidates Only (default null)
+            res.view_raw = null;
+            const isInvalidFeedViewCmd = (str) => {
+                if (!str) return true;
+                const s = str.trim();
+                return /^(?:view|xem|ver)\s+(?:profile|more|trang cá nhân|thêm|replies|câu trả lời|bình luận|comments|photos?|ảnh|videos?|history|insights|posts?)/i.test(s) ||
+                       /(?:more\s+comments|replies|câu trả lời|bình luận\s+khác)$/i.test(s) ||
+                       /target\s+is\s+\d+\s+views/i.test(s);
+            };
+            const feedViewPat = /^(?:([\d.,]+[KkMmB]?|\d+\s*(?:nghìn|ngàn|triệu|tr|mil|millones))\s+(?:views?|lượt xem|reproducciones))$/i;
+            const feedCandEls = Array.from(el.querySelectorAll('span, div, [role="button"], a')).filter(item => {
+                if (item.closest('div[data-ad-preview="message"], div[data-ad-comet-preview="message"]')) return false;
+                if (item.closest('ul, [role="article"] [role="article"]')) return false;
+                const aria = (item.getAttribute('aria-label') || '').trim();
+                const txt = (item.innerText || '').trim();
+                if (isInvalidFeedViewCmd(aria) || isInvalidFeedViewCmd(txt)) return false;
+                return feedViewPat.test(aria) || feedViewPat.test(txt);
+            });
+            for (const item of feedCandEls) {
+                const aria = (item.getAttribute('aria-label') || '').trim();
+                const txt = (item.innerText || '').trim();
+                const m = aria.match(feedViewPat) || txt.match(feedViewPat);
+                if (m) {
+                    res.view_raw = m[1];
+                    break;
+                }
             }
-            const vMatch = text.match(/\b(\d[\d.,]*[KkMmB]?)\s+(?:views?|lượt xem|reproducciones)\b/i);
-            if (vMatch) res.view_raw = vMatch[1];
 
             if (el.querySelector('video') || el.querySelector('[data-video-id]')) {
                 res.media_type = 'video';
@@ -1982,11 +2816,15 @@ def extract_feed_card_data(
     share_val, share_approx = parse_numeric_count_with_meta(dom_metrics.get("share_raw"))
     view_val, view_approx = parse_numeric_count_with_meta(dom_metrics.get("view_raw"))
 
+    feed_media_type = dom_metrics.get("media_type", "text")
+    if feed_media_type == "video":
+        extracted_text = None
+
     # 8. Sport classification strictly from caption evidence
     sport_category, sport_meta = classify_post_sport(
         extracted_text,
         sport_hint=sport_hint,
-        media_type=dom_metrics.get("media_type", "text"),
+        media_type=feed_media_type,
     )
 
     review_reasons = []
@@ -1995,7 +2833,7 @@ def extract_feed_card_data(
     if not post_url or not post_id:
         review_reasons.append("Card post permalink or ID could not be identified.")
     if not extracted_text:
-        missing_reasons["text"] = "text_not_found"
+        missing_reasons["text"] = "video_text_omitted" if feed_media_type == "video" else "text_not_found"
     if iso_published is None:
         missing_reasons["published_at"] = time_precision
     if like_val is None:
@@ -2009,7 +2847,7 @@ def extract_feed_card_data(
     if not sport_category:
         missing_reasons["sport_category"] = sport_meta.get("status", "unidentified_sport")
 
-    status = "success" if (extracted_text and post_id and not review_reasons) else "needs_review"
+    status = "success" if ((extracted_text or feed_media_type == "video") and post_id and not review_reasons) else "needs_review"
 
     tech_meta = {
         "status": status,

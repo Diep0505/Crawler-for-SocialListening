@@ -1,0 +1,339 @@
+# 30 additional Facebook source candidates for NBA research
+# Prepared: 2026-10-17 (Asia/Ho_Chi_Minh)
+# These are 30 NEW Page URLs, excluding the 20 previous additions and the original 5 Pages.
+# Evidence identifies the publisher/Page; it does NOT measure recent Facebook activity or crawl yield.
+# Some Facebook search records were indexed over a year ago; confirm activity in the logged-in session.
+# Editorial quality and long articles on a website do not guarantee long Facebook captions.
+# Some sources cover WNBA, NCAA, EuroLeague or general basketball. Apply per-post NBA filtering.
+# Keep the existing policy of omitting video captions; prioritize valid text/image posts.
+# Many sources belong to FanSided; do not treat 30 Pages as 30 independent media networks.
+# Import format: one Facebook source URL per non-comment line.
+
+# 01. Hoops Habit | NBA-wide; news, opinion and analysis
+# Publisher: https://hoopshabit.com/
+# Identity evidence: publisher website link; Facebook search result
+https://www.facebook.com/HoopsHabit/
+
+# 02. Sir Charles in Charge | NBA-wide; opinion, trades and roster analysis
+# Publisher: https://sircharlesincharge.com/
+# Identity evidence: publisher website link
+https://www.facebook.com/SirCharlesInCharge/
+
+# 03. HoopsHype | NBA news, players, transactions and salaries
+# Publisher: https://hoopshype.com/salaries/
+# Identity evidence: Facebook search result
+https://www.facebook.com/HoopsHype/
+
+# 04. Basketball Network | NBA current and historical stories; also other basketball
+# Publisher: https://www.basketballnetwork.net/about
+# Identity evidence: Facebook search result; publisher identifies Facebook presence
+https://www.facebook.com/basketballnetwork.net/
+
+# 05. RealGM | Basketball news, transactions and analysis; filter NBA
+# Publisher: https://basketball.realgm.com/
+# Identity evidence: Facebook search result
+https://www.facebook.com/RealGM/
+
+# 06. TalkBasket | NBA plus EuroLeague/FIBA; filter NBA
+# Publisher: https://www.talkbasket.net/
+# Identity evidence: publisher website link
+https://www.facebook.com/talkbasketnet/
+
+# 07. Basketball Insiders | Basketball news, rumors and insights; filter NBA
+# Publisher: https://www.basketballinsiders.com/
+# Identity evidence: Facebook search result
+https://www.facebook.com/BasketballInsiders/
+
+# 08. SLAM | Basketball players, interviews and culture; filter NBA
+# Publisher: https://slamonline.com/
+# Identity evidence: publisher website link
+https://www.facebook.com/SLAMMagazine/
+
+# 09. Lakers Nation | Los Angeles Lakers
+# Publisher: https://lakersnation.com/about/
+# Identity evidence: publisher website link; Facebook search result
+https://www.facebook.com/LakersNation/
+
+# 10. Heat Nation | Miami Heat
+# Publisher: https://heatnation.com/
+# Identity evidence: publisher website link
+https://www.facebook.com/HeatNation/
+
+# 11. Raptors Nation | Toronto Raptors
+# Publisher: https://raptorsnation.com/
+# Identity evidence: Facebook search result
+https://www.facebook.com/RaptorsNation/
+
+# 12. Lake Show Life | Los Angeles Lakers
+# Publisher: https://lakeshowlife.com/
+# Identity evidence: publisher website link
+https://www.facebook.com/LakeShowLife/
+
+# 13. Hardwood Houdini | Boston Celtics
+# Publisher: https://hardwoodhoudini.com/
+# Identity evidence: publisher website link
+https://www.facebook.com/hardwoodhoudini33/
+
+# 14. Blue Man Hoop | Golden State Warriors
+# Publisher: https://bluemanhoop.com/
+# Identity evidence: publisher website link
+https://www.facebook.com/BlueManHoop/
+
+# 15. The Smoking Cuban | Dallas Mavericks
+# Publisher: https://thesmokingcuban.com/
+# Identity evidence: publisher website link
+https://www.facebook.com/TheSmokingCuban/
+
+# 16. Thunderous Intentions | Oklahoma City Thunder
+# Publisher: https://thunderousintentions.com/
+# Identity evidence: publisher website link
+https://www.facebook.com/ThunderousIntentions/
+
+# 17. Nugg Love | Denver Nuggets
+# Publisher: https://nugglove.com/
+# Identity evidence: publisher website link; retain published handle rather than guessing from site name
+https://www.facebook.com/nuggetslove/
+
+# 18. Air Alamo | San Antonio Spurs
+# Publisher: https://airalamo.com/
+# Identity evidence: publisher website link
+https://www.facebook.com/AirAlamo/
+
+# 19. Pippen Ain't Easy | Chicago Bulls
+# Publisher: https://pippenainteasy.com/
+# Identity evidence: publisher website link
+https://www.facebook.com/PippenAintEasyFS/
+
+# 20. Daily Knicks | New York Knicks
+# Publisher: https://dailyknicks.com/
+# Identity evidence: publisher website link
+https://www.facebook.com/DailyKnicks/
+
+# 21. King James Gospel | Cleveland Cavaliers
+# Publisher: https://kingjamesgospel.com/
+# Identity evidence: publisher website link
+https://www.facebook.com/fansidedkjg/
+
+# 22. The Sixer Sense | Philadelphia 76ers
+# Publisher: https://thesixersense.com/
+# Identity evidence: publisher website link
+https://www.facebook.com/SixerSense/
+
+# 23. Rip City Project | Portland Trail Blazers
+# Publisher: https://ripcityproject.com/
+# Identity evidence: publisher website link
+https://www.facebook.com/RipCityProject/
+
+# 24. The J-Notes | Utah Jazz
+# Publisher: https://thejnotes.com/
+# Identity evidence: publisher website link
+https://www.facebook.com/thejnotes/
+
+# 25. Valley of the Suns | Phoenix Suns
+# Publisher: https://valleyofthesuns.com/
+# Identity evidence: publisher website link
+https://www.facebook.com/ValleyoftheSuns/
+
+# 26. Behind the Buck Pass | Milwaukee Bucks
+# Publisher: https://behindthebuckpass.com/
+# Identity evidence: publisher website link
+https://www.facebook.com/BehindTheBuckPass/
+
+# 27. 8 Points, 9 Seconds | Indiana Pacers
+# Publisher: https://8points9seconds.com/
+# Identity evidence: publisher website link
+https://www.facebook.com/8points9seconds/
+
+# 28. Orlando Magic Daily | Orlando Magic
+# Publisher: https://orlandomagicdaily.com/
+# Identity evidence: publisher website link
+https://www.facebook.com/OrlandoMagicDaily/
+
+# 29. Peachtree Hoops | Atlanta Hawks; also WNBA Atlanta Dream, filter NBA
+# Publisher: https://www.peachtreehoops.com/
+# Identity evidence: publisher website link
+https://www.facebook.com/peachtreehoops/
+
+# 30. Denver Stiffs | Denver Nuggets
+# Publisher: https://www.denverstiffs.com/
+# Identity evidence: Facebook search result; publisher NBA coverage indexed in October 2026
+https://www.facebook.com/denverstiffs/
+
+
+# 30 additional multilingual Facebook Page candidates for NBA data collection
+# Prepared: 2026-10-17
+# Languages: vi, fr, es, pt, it, de, ja, zh-Hant, id, th, ar (11 languages).
+# Language labels indicate expected source language, not the language of every post.
+# These URLs are additional to the 50 previous suggestions and original 5 Pages.
+# Evidence confirms Page identity/topic or publisher links; recent Facebook activity and crawl yield were NOT benchmarked.
+# NBA-related does not mean every post is about NBA: apply the existing per-post NBA filter.
+# Keep the existing policy of omitting video captions and prioritizing valid text/image posts.
+# A long article on a publisher website does not guarantee a long Facebook caption.
+# Do not force the existing language field to en; preserve original text and detect language per post.
+# Pilot multilingual classification plus localized timestamps/counts before an unattended run.
+# This file lists Pages only, not Groups. It does not change crawler code or the output schema.
+# Numeric profile.php URLs preserve Page IDs published in /p/Name-ID/ links.
+# Import format: one source URL per non-comment line; # lines are notes.
+
+# 01. NBA Vietnam | vi | Vietnamese
+# Scope: NBA news and community; regional NBA Page
+# Evidence / published link: https://www.facebook.com/nbavietnam/
+https://www.facebook.com/nbavietnam/
+
+# 02. FPT Bóng Rổ | vi | Vietnamese
+# Scope: NBA plus other basketball; per-post NBA filter
+# Evidence / published link: https://www.facebook.com/FPTBongRo/
+https://www.facebook.com/FPTBongRo/
+
+# 03. Bóng Rổ Việt Nam | vi | Vietnamese
+# Scope: NBA, VBA and Vietnamese basketball; per-post NBA filter
+# Evidence / published link: https://www.facebook.com/Bongrovietnam/
+https://www.facebook.com/Bongrovietnam/
+
+# 04. Bóng rổ TV | vi | Vietnamese
+# Scope: Basketball news including NBA; per-post NBA filter
+# Evidence / published link: https://www.facebook.com/bongrotv/
+https://www.facebook.com/bongrotv/
+
+# 05. Ballers' Talk | vi | Vietnamese
+# Scope: NBA/basketball community; may cover other sports
+# Evidence / published link: https://www.facebook.com/ballerstalkVN/
+https://www.facebook.com/ballerstalkVN/
+
+# 06. Basket USA | fr | French
+# Scope: NBA news, players and analysis
+# Evidence / published link: https://www.basketusa.com/
+https://www.facebook.com/BasketUSA/
+
+# 07. TrashTalk | fr | French
+# Scope: NBA news, opinion and basketball culture
+# Evidence / published link: https://trashtalk.co/
+https://www.facebook.com/trashtalk.fr/
+
+# 08. REVERSE / BasketSession | fr | French
+# Scope: NBA and basketball news/features; per-post NBA filter
+# Evidence / published link: https://www.facebook.com/BasketSession/
+https://www.facebook.com/BasketSession/
+
+# 09. Parlons Basket NBA | fr | French
+# Scope: NBA-specific Page of Parlons Basket
+# Evidence / published link: https://www.facebook.com/ParlonsBasketNBA/
+https://www.facebook.com/ParlonsBasketNBA/
+
+# 10. BeBasket NBA | fr | French
+# Scope: NBA-focused Page; distinct from general BeBasket Page
+# Evidence / published link: https://www.facebook.com/bebasket.nba/
+https://www.facebook.com/bebasket.nba/
+
+# 11. Basket Infos | fr | French
+# Scope: NBA news and players
+# Evidence / published link: https://www.facebook.com/p/Basket-Infos-100080963756070/
+https://www.facebook.com/profile.php?id=100080963756070
+
+# 12. Inside Basket | fr | French
+# Scope: NBA news, results, player stories and analysis
+# Evidence / published link: https://www.insidebasket.com/
+https://www.facebook.com/InsideBasket/
+
+# 13. NBA México | es | Spanish
+# Scope: NBA news and regional content
+# Evidence / published link: https://www.facebook.com/NBAMexico/
+https://www.facebook.com/NBAMexico/
+
+# 14. NBA LATAM | es | Spanish
+# Scope: NBA content for Latin America
+# Evidence / published link: https://www.facebook.com/NBALatam/
+https://www.facebook.com/NBALatam/
+
+# 15. nbamaniacs | es | Spanish
+# Scope: NBA news, articles and analysis
+# Evidence / published link: https://www.nbamaniacs.com/
+https://www.facebook.com/nbamaniacs/
+
+# 16. HispanosNBA | es | Spanish
+# Scope: NBA news, statistics and Hispanic players
+# Evidence / published link: https://www.hispanosnba.com/
+https://www.facebook.com/hispanosnba/
+
+# 17. Gigantes del Basket | es | Spanish
+# Scope: NBA plus ACB/EuroLeague/general basketball; per-post NBA filter
+# Evidence / published link: https://www.gigantes.com/
+https://www.facebook.com/gigantesdelbasket/
+
+# 18. NBA Brasil | pt | Portuguese
+# Scope: NBA news and regional content
+# Evidence / published link: https://www.facebook.com/NBABrasil/
+https://www.facebook.com/NBABrasil/
+
+# 19. Bola Presa | pt | Portuguese
+# Scope: NBA analysis, opinion and podcast-related posts
+# Evidence / published link: https://www.facebook.com/bolapresa/
+https://www.facebook.com/bolapresa/
+
+# 20. Jumper Brasil | pt | Portuguese
+# Scope: NBA/basketball news; check displayed identity if handle redirects
+# Evidence / published link: https://www.facebook.com/jumperbrasil/photos/
+https://www.facebook.com/jumperbrasil/
+
+# 21. NBAPassion | it | Italian
+# Scope: NBA news and analysis plus Italian basketball; per-post NBA filter
+# Evidence / published link: https://www.nbapassion.com/
+https://www.facebook.com/NbaPassionCom/
+
+# 22. NbaReligion.com | it | Italian
+# Scope: NBA news, articles and analysis
+# Evidence / published link: https://www.nbareligion.com/
+https://www.facebook.com/NbaReligion/
+
+# 23. Dunkest | it | Italian
+# Scope: NBA news, stats and fantasy basketball; filter promotional/game-only posts
+# Evidence / published link: https://www.facebook.com/DunkestFantasyBasketball/
+https://www.facebook.com/DunkestFantasyBasketball/
+
+# 24. basketball.de | de | German
+# Scope: NBA plus German/European basketball; per-post NBA filter
+# Evidence / published link: https://basketball.de/
+https://www.facebook.com/www.basketball.de/
+
+# 25. NBA Japan | ja | Japanese
+# Scope: Japanese regional NBA content; some posts may be English
+# Evidence / published link: https://www.facebook.com/NBAJapan/
+https://www.facebook.com/NBAJapan/
+
+# 26. NBA Taiwan | zh-Hant | Traditional Chinese
+# Scope: Traditional Chinese regional NBA content
+# Evidence / published link: https://www.facebook.com/nba.taiwan/
+https://www.facebook.com/nba.taiwan/
+
+# 27. NBA Indonesia | id | Indonesian
+# Scope: Indonesian regional NBA content; some posts may be English
+# Evidence / published link: https://www.facebook.com/nbaindonesia/
+https://www.facebook.com/nbaindonesia/
+
+# 28. NBA Live in Thailand | th | Thai
+# Scope: Independent NBA news/community Page
+# Evidence / published link: https://www.facebook.com/nbaliveinthailand/
+https://www.facebook.com/nbaliveinthailand/
+
+# 29. NBA Time | th | Thai
+# Scope: Independent NBA news, results and community Page
+# Evidence / published link: https://www.facebook.com/p/NBA-Time-100064447792032/
+https://www.facebook.com/profile.php?id=100064447792032
+
+# 30. NBA Arabic | ar | Arabic
+# Scope: Arabic-language regional NBA content
+# Evidence / published link: https://www.facebook.com/NBAArabic/
+https://www.facebook.com/NBAArabic/
+
+
+
+
+# Gợi ý bổ sung thêm các fanpage chính thức của các đội bóng hoặc trang tin NBA uy tín:
+# https://www.facebook.com/warriors/
+# https://www.facebook.com/losangeleslakers/
+# https://www.facebook.com/celtics/
+# https://www.facebook.com/profile.php?id=100063767167572
+# https://www.facebook.com/espnnba/
+# https://www.facebook.com/BleacherReportHoops/
+# https://www.facebook.com/basketballforever/
+# https://www.facebook.com/ClutchPoints/

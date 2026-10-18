@@ -282,11 +282,32 @@ class TestFacebookScraperUnits(unittest.TestCase):
         author_profile = fd.extract_author_id("https://www.facebook.com/profile.php?id=100054321")
         self.assertEqual(author_profile, "100054321")
 
-    def test_collected_at_utc_compliance(self):
-        """Verifies collected_at defaults to UTC timezone."""
+    def test_collected_at_tz_compliance(self):
+        """Verifies collected_at defaults to Vietnam timezone (+07:00) and converts +00:00 to +07:00."""
         rec = fd.build_dataset_record("https://www.facebook.com/atletismoRFEA/posts/123")
         collected_at = rec["collected_at"]
-        self.assertTrue(collected_at.endswith("+00:00") or collected_at.endswith("Z"))
+        self.assertTrue(collected_at.endswith("+07:00"))
+
+        rec_conv = fd.build_dataset_record(
+            "https://www.facebook.com/atletismoRFEA/posts/123",
+            collected_at="2026-10-16T18:25:29.712611+00:00"
+        )
+        self.assertEqual(rec_conv["collected_at"], "2026-10-17T01:25:29.712611+07:00")
+
+    def test_video_media_type_omits_text(self):
+        """Verifies that posts with media_type='video' omit caption text, hashtags, mentions, and sport."""
+        rec = fd.build_dataset_record(
+            "https://www.facebook.com/nba/posts/123",
+            text="Junk or video player caption here #NBA @nba",
+            media_type="video",
+            sport_category="Basketball"
+        )
+        self.assertIsNone(rec["text"])
+        self.assertIsNone(rec["language"])
+        self.assertEqual(rec["hashtags"], [])
+        self.assertEqual(rec["mentions"], [])
+        self.assertIsNone(rec["sport_category"])
+        self.assertEqual(rec["media_type"], "video")
 
     def test_discover_post_url_parsing(self):
         """Verifies discover tool parsing of both /posts/ and /share/p/ URLs."""

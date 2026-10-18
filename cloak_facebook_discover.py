@@ -171,13 +171,20 @@ SCAN_JS = r"""() => {
 
 
 def access_issue(page):
-    parsed = urlparse(page.url)
-    if parsed.path.lower().startswith(("/login", "/checkpoint", "/recover")):
-        return "Facebook requires login/verification. Halting to resolve with login script."
-    email = page.locator('input[name="email"]').first
-    password = page.locator('input[name="pass"]').first
-    if email.is_visible() and password.is_visible():
-        return "Login screen detected. Run cloak_facebook_login.py first."
+    if page is None or not hasattr(page, "url"):
+        return None
+    page_url = str(page.url) if (page.url and isinstance(page.url, str)) else ""
+    if page_url:
+        parsed = urlparse(page_url)
+        if parsed.path.lower().startswith(("/login", "/checkpoint", "/recover")):
+            return "Facebook requires login/verification. Halting to resolve with login script."
+    try:
+        email = page.locator('input[name="email"]').first
+        password = page.locator('input[name="pass"]').first
+        if email.is_visible() and password.is_visible():
+            return "Login screen detected. Run cloak_facebook_login.py first."
+    except Exception:
+        pass
     return None
 
 
@@ -219,6 +226,164 @@ def refresh_after_idle(page, cooldown_seconds):
     return access_issue(page)
 
 
+class PageDiscoverySession:
+    """Manages an active, stateful Facebook Page discovery tab.
+    Allows discovering URLs in batches while keeping the browser tab open and scrolled,
+    so that resuming discovery does not re-navigate or reload the Page from the top.
+    """
+    def __init__(
+        self,
+        page_url,
+        context,
+        max_scrolls=100,
+        idle_rounds=10,
+        max_refreshes=0,
+        refresh_wait=15,
+        deadline_mono=None,
+        existing_seen_keys=None,
+    ):
+        self.raw_page_url = page_url
+        self.clean_url, self.owner = parse_source_url(page_url)
+        self.is_news_feed = (self.owner == "news_feed")
+        self.context = context
+        self.max_scrolls = max_scrolls
+        self.idle_rounds = idle_rounds
+        self.max_refreshes = max_refreshes
+        self.refresh_wait = refresh_wait
+        self.deadline_mono = deadline_mono
+        self.seen = set(existing_seen_keys or [])
+        self.source_seen = set()
+        self.page = None
+        self.owners = {self.owner.lower()}
+        self.scroll_round = 0
+        self.idle = 0
+        self.refreshes = 0
+        self.is_exhausted = False
+        self.stop_reason = None
+        self.total_discovered = 0
+
+    def start(self, timeout=60000):
+        if self.page is None:
+            self.page = self.context.new_page()
+            self.page.goto(self.clean_url, wait_until="domcontentloaded", timeout=timeout)
+            time.sleep(3.5)
+            try:
+                _, redirected_owner = parse_source_url(self.page.url)
+                self.owners.add(redirected_owner.lower())
+            except ValueError:
+                pass
+
+    def is_deadline_reached(self):
+        return self.deadline_mono is not None and time.monotonic() >= self.deadline_mono
+
+    def discover_batch(self, batch_size=20, on_url_discovered=None, deadline_mono=None):
+        """Scans and scrolls the Page, discovering permalinks until batch_size new URLs are found,
+        the scroll limit is reached, or the source stalls.
+        The page tab remains OPEN and at its current position after returning!
+        """
+        if deadline_mono:
+            self.deadline_mono = deadline_mono
+
+        if self.page is None:
+            self.start()
+
+        batch_new = []
+
+        while self.scroll_round < self.max_scrolls:
+            if self.is_deadline_reached():
+                self.stop_reason = "deadline_reached"
+                break
+
+            issue = access_issue(self.page)
+            if issue:
+                self.stop_reason = issue
+                raise ValueError(issue)
+
+            snapshot = self.page.evaluate(SCAN_JS)
+            discovered_this_round = 0
+
+            for link in snapshot["links"]:
+                parsed_post = parse_post_url(link["href"])
+                if not parsed_post:
+                    continue
+                post_owner = parsed_post["owner_token"].lower()
+                if not self.is_news_feed and post_owner not in self.owners and not (post_owner.isdigit() and not any(x.isdigit() for x in self.owners)):
+                    continue
+
+                key = parsed_post["discovery_key"]
+                if key not in self.source_seen:
+                    self.source_seen.add(key)
+                    discovered_this_round += 1
+
+                if key not in self.seen:
+                    self.seen.add(key)
+                    item = {
+                        **parsed_post,
+                        "platform": "facebook",
+                        "source_url": self.clean_url,
+                        "discovered_at": utc_now(),
+                    }
+                    self.total_discovered += 1
+                    is_new_to_queue = True
+                    if on_url_discovered:
+                        try:
+                            cb_res = on_url_discovered(item)
+                            if cb_res is False:
+                                is_new_to_queue = False
+                        except Exception as exc:
+                            pass
+
+                    if is_new_to_queue:
+                        batch_new.append(item)
+                        if len(batch_new) >= batch_size:
+                            # Yield control to extraction; keep page open!
+                            return batch_new
+
+            self.scroll_round += 1
+
+            if discovered_this_round == 0:
+                self.idle += 1
+            else:
+                self.idle = 0
+
+            if self.idle >= self.idle_rounds:
+                if self.refreshes < self.max_refreshes:
+                    self.refreshes += 1
+                    issue = refresh_after_idle(self.page, self.refresh_wait)
+                    if issue:
+                        self.stop_reason = issue
+                        raise ValueError(issue)
+                    self.source_seen.clear()
+                    self.idle = 0
+                    continue
+                else:
+                    self.is_exhausted = True
+                    self.stop_reason = "idle_rounds_exhausted"
+                    break
+
+            # Scroll down
+            self.page.mouse.wheel(0, 750)
+            target = time.monotonic() + 2.5
+            while time.monotonic() < target:
+                if self.is_deadline_reached():
+                    break
+                time.sleep(0.3)
+
+        if self.scroll_round >= self.max_scrolls:
+            self.is_exhausted = True
+            self.stop_reason = "max_scrolls_budget_reached"
+
+        return batch_new
+
+    def close(self):
+        if self.page is not None:
+            try:
+                self.page.close()
+            except Exception:
+                pass
+            self.page = None
+
+
 def discover_page_posts(
     page_url,
     limit=30,
@@ -235,17 +400,13 @@ def discover_page_posts(
     """Discovers post permalinks from a given Facebook Page URL using shared recovery and refresh logic.
     Returns a list of dicts with post_url, post_id, etc.
     """
-    clean_url, owner = parse_source_url(page_url)
-    is_news_feed = (owner == "news_feed")
     profile_path = Path(profile_dir)
-    
-    import facebook_dataset as fd
-    fd.clean_profile_locks(profile_path)
-
     owns_context = False
     if context is None:
         if not profile_path.is_dir():
             raise FileNotFoundError(f"Profile directory not found: {profile_path}")
+        import facebook_dataset as fd
+        fd.clean_profile_locks(profile_path)
         from cloakbrowser import launch_persistent_context
         context = launch_persistent_context(
             str(profile_path),
@@ -256,87 +417,34 @@ def discover_page_posts(
         owns_context = True
 
     discovered = []
-    seen = set(existing_seen_keys or [])
     deadline = (time.monotonic() + max_hours * 3600) if (max_hours and max_hours > 0) else None
 
-    page = context.new_page()
+    session = PageDiscoverySession(
+        page_url=page_url,
+        context=context,
+        max_scrolls=max_scrolls,
+        idle_rounds=idle_rounds,
+        max_refreshes=max_refreshes,
+        refresh_wait=refresh_wait,
+        deadline_mono=deadline,
+        existing_seen_keys=existing_seen_keys,
+    )
+
     try:
-        page.goto(clean_url, wait_until="domcontentloaded", timeout=60000)
-        time.sleep(4)
-        owners = {owner.lower()}
-        try:
-            _, redirected_owner = parse_source_url(page.url)
-            owners.add(redirected_owner.lower())
-        except ValueError:
-            pass
-
-        idle = 0
-        refreshes = 0
-        source_seen = set()
-
-        for scroll_round in range(1, max_scrolls + 1):
-            if deadline and time.monotonic() >= deadline:
+        session.start()
+        while not session.is_exhausted and len(discovered) < limit:
+            batch = session.discover_batch(batch_size=min(20, limit - len(discovered)), deadline_mono=deadline)
+            discovered.extend(batch)
+            if not batch and session.is_exhausted:
                 break
-
-            issue = access_issue(page)
-            if issue:
-                raise ValueError(issue)
-
-            snapshot = page.evaluate(SCAN_JS)
-            discovered_this_round = 0
-
-            for link in snapshot["links"]:
-                parsed_post = parse_post_url(link["href"])
-                if not parsed_post:
-                    continue
-                post_owner = parsed_post["owner_token"].lower()
-                if not is_news_feed and post_owner not in owners and not (post_owner.isdigit() and not any(x.isdigit() for x in owners)):
-                    continue
-
-                key = parsed_post["discovery_key"]
-                if key not in source_seen:
-                    source_seen.add(key)
-                    discovered_this_round += 1
-
-                if key not in seen:
-                    seen.add(key)
-                    discovered.append({
-                        **parsed_post,
-                        "platform": "facebook",
-                        "source_url": clean_url,
-                        "discovered_at": utc_now(),
-                    })
-                    if len(discovered) >= limit:
-                        break
-
-            if len(discovered) >= limit:
-                break
-
-            idle = idle + 1 if discovered_this_round == 0 else 0
-            if idle >= idle_rounds:
-                if refreshes >= max_refreshes:
-                    break
-                refreshes += 1
-                issue = refresh_after_idle(page, refresh_wait)
-                if issue:
-                    raise ValueError(issue)
-                source_seen.clear()
-                idle = 0
-                continue
-
-            page.mouse.wheel(0, 750)
-            time.sleep(3)
-
     finally:
-        try:
-            page.close()
-        except Exception:
-            pass
+        session.close()
         if owns_context:
             try:
                 context.close()
             except Exception:
                 pass
+            import facebook_dataset as fd
             fd.clean_profile_locks(profile_path)
 
     return discovered

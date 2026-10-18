@@ -1,276 +1,254 @@
-# Facebook Social Listening & Dataset Extraction Pipeline
+# Facebook NBA Social Listening & Dataset Collection Pipeline
 
-A production-grade, automated, and resumable social listening crawler for extracting Facebook posts, interaction metrics, verified timestamps, author metadata, and sports categorizations into a strict 17-column dataset format.
+A production-grade, automated, and resumable social listening pipeline for discovering and extracting Facebook posts, engagement metrics, verified timestamps, author metadata, and strict NBA competition evidence into a standard 17-column dataset format.
 
-Built with **Python**, **Playwright**, and **CloakBrowser** (stealth anti-detection browser engine) on macOS.
-
----
-
-## Table of Contents
-1. [Project Overview](#project-overview)
-2. [Key Capabilities & Technical Features](#key-capabilities--technical-features)
-3. [The 17-Column Dataset Specification](#the-17-column-dataset-specification)
-4. [Project Structure](#project-structure)
-5. [Prerequisites & Authentication Setup](#prerequisites--authentication-setup)
-6. [Command-Line Interface (CLI) Usage](#command-line-interface-cli-usage)
-7. [Resumption & Task State Management](#resumption--task-state-management)
-8. [Automated Verification & Unit Testing](#automated-verification--unit-testing)
-9. [Output Artifacts & File Formats](#output-artifacts--file-formats)
-10. [Troubleshooting & Best Practices](#troubleshooting--best-practices)
+Built with **Python**, **Playwright**, **CloakBrowser** (stealth anti-detection browser engine), and **SQLite** on macOS Apple Silicon.
 
 ---
 
-## 1. Project Overview
-
-This project provides an automated pipeline designed to convert unstructured Facebook posts—either sourced from an arbitrary URL list (TXT/JSONL/CSV) or dynamically discovered from Facebook Pages—into standardized, schema-compliant datasets for social listening analysis.
-
-The architecture addresses common failure modes in social media scraping:
-- **Obfuscated Facebook DOM:** Prevents zero-width character noise and dynamic class naming from corrupting captions and metrics.
-- **Accurate Container Scoping:** Uses DOM traversal anchored on semantic containers (`div[data-ad-preview="message"]` and post toolbars) to ensure comments, sidebars, and recommendation posts never bleed into the main post caption.
-- **True Hover Timestamps:** Uses automated mouse positioning to hover over post permalinks, triggering Facebook's native tooltip (`[role="tooltip"]`) to extract exact date-times with timezone offsets.
-- **Robust Multi-Lingual Normalization:** Handles diverse numbering formats (`1.2K`, `1,2K`, `1.234`, `1,2 nghìn`) and standardizes sports terminology across English, Spanish, Vietnamese, and French.
-- **Transactional Resumption:** Powered by an embedded SQLite database that tracks task statuses (`pending`, `processing`, `success`, `needs_review`, `failed`), enabling interruption and seamless resumption without duplicate web requests.
-
----
-
-## 2. Key Capabilities & Technical Features
-
-- **Anchor-Free Extraction:** Automatically discovers and extracts the complete post caption without requiring hardcoded keywords or pre-entered snippet sentences.
-- **"See More" Expansion:** Automatically detects and triggers multi-lingual expanders (*"See more"*, *"Xem thêm"*, *"Ver más"*, *"Mehr anzeigen"*, *"Voir plus"*) strictly within the active post card.
-- **Isolated Metrics Extraction:**
-  - `like_count`: Captures total aggregated reactions (Like, Love, Care, Haha, Wow, Sad, Angry) from summary badges, distinct from the interactive Like action button.
-  - `comment_count` & `share_count`: Extracted independently from footer summaries; explicitly recognizes zero-evidence states (e.g., `"No comments yet"` $\to$ `0`).
-- **Author & Follower Resolution:** Automatically navigates to the author's public profile/page tab to record the verified follower count (with caching by author handle).
-- **Stealth Browser Session:** Runs on `CloakBrowser` with persistent fingerprint seeds (`12345`) and safe lock cleanup (checks process PID before removing `SingletonLock`).
-- **Checkpoint / Login Detection:** Halts gracefully and preserves database state if Facebook prompts for a login checkpoint or captcha.
+## Mục lục
+1. [Tổng quan chương trình](#1-tổng-quan-chương-trình)
+2. [Cơ chế điều phối theo lô & Discovery liên tục](#2-cơ-chế-điều-phối-theo-lô--discovery-liên-tục)
+3. [Tiêu chuẩn chất lượng dữ liệu & Bộ lọc NBA](#3-tiêu-chuẩn-chất-lượng-dữ-liệu--bộ-lọc-nba)
+4. [Định dạng dữ liệu 17 cột](#4-định-dạng-dữ-liệu-17-cột)
+5. [Cấu trúc thư mục & Artifacts](#5-cấu-trúc-thư-mục--artifacts)
+6. [Thiết lập môi trường & Đăng nhập](#6-thiết-lập-môi-trường--đăng-nhập)
+7. [Lệnh chạy thử nghiệm 60 phút (Pilot Benchmark)](#7-lệnh-chạy-thử-nghiệm-60-phút-pilot-benchmark)
+8. [Lệnh tham khảo cho phiên dài 8 giờ](#8-lệnh-tham-khảo-cho-phiên-dài-8-giờ)
+9. [Bảng tham số dòng lệnh (CLI Reference)](#9-bảng-tham-số-dòng-lệnh-cli-reference)
+10. [Kiểm thử offline (Unit & Integration Tests)](#10-kiểm-thử-offline-unit--integration-tests)
+11. [Xử lý sự cố & Phiên đăng nhập (Troubleshooting)](#11-xử-lý-sự-cố--phiên-đăng-nhập-troubleshooting)
 
 ---
 
-## 3. The 17-Column Dataset Specification
+## 1. Tổng quan chương trình
 
-The final exported dataset strictly implements the 17-column schema specified in `sources/dataset_requirements.xlsx`. All secondary technical metadata (such as time precision, approximate count flags, and review reasons) is stored outside this primary schema in debug bundles.
+Chương trình phục vụ nghiên cứu Social Listening mảng **Sport → Basketball → NBA**, thu thập dữ liệu bài viết từ danh sách Facebook Fanpage chính thức và uy tín về NBA.
 
-| # | Column Name | Type | Description & Business Rules | Example Value |
-|---|---|---|---|---|
-| 1 | `post_id` | String | Unique Facebook post identifier (canonical string or numeric ID). | `"pfbid08xPjdDRwefEd..."` |
-| 2 | `platform` | String | Static social media platform identifier. | `"Facebook"` |
-| 3 | `text` | String | Clean, full post caption. Excludes comments, author handles, and navigation text. | `"Las 12 campanadas del atletismo..."` |
-| 4 | `published_at` | String / null | Standardized ISO 8601 timestamp with timezone. Extracted via native tooltip. | `"2022-12-29T22:32:00+07:00"` |
-| 5 | `collected_at` | String | UTC ISO 8601 timestamp recording the exact time of observation. | `"2026-10-15T18:01:25.641659+00:00"` |
-| 6 | `author_id` | String | Page handle, username, or profile ID of the publishing account. | `"atletismoRFEA"` |
-| 7 | `language` | String | Detected language code (`"en"`, `"es"`, `"vi"`, `"fr"`), or `"unknown"`. | `"es"` |
-| 8 | `hashtags` | Array[String] | List of hashtags extracted directly from the post text. | `["#42KValència", "#Maraton"]` |
-| 9 | `mentions` | Array[String] | List of account mentions (`@handle`) extracted from the post text. | `["@maratonvalencia"]` |
-| 10 | `like_count` | Integer / null | Total reaction count across all emotion types. Null if not displayed. | `44` |
-| 11 | `comment_count` | Integer / null | Total comment count. Recorded as `0` only when explicit evidence exists. | `2` |
-| 12 | `share_count` | Integer / null | Total share count. Recorded as `0` or `null` when not displayed. | `6` |
-| 13 | `view_count` | Integer / null | Public view count (applicable to Video and Reel formats; null for static posts). | `null` |
-| 14 | `media_type` | String | Primary media attachment type (`"image"`, `"video"`, or `"text"`). | `"image"` |
-| 15 | `author_followers` | Integer / null | Number of followers of the publishing author/page at time of scraping. | `88000` |
-| 16 | `post_url` | String | Canonical permalink URL of the post. | `"https://www.facebook.com/atletismoRFEA/posts/..."` |
-| 17 | `sport_category` | String / null | Standardized sport category classification (e.g., `"Athletics"`, `"Football"`). | `"Athletics"` |
+### Đặc điểm kiến trúc:
+- **Luồng thu thập:** Khám phá URL (`Page discovery`) $\to$ lưu hàng đợi SQLite $\to$ mở từng URL bài viết để trích xuất chi tiết 17 cột.
+- **Trình duyệt đơn phiên (Single Persistent Context):** Sử dụng 1 browser session duy nhất với profile lưu trữ tại `profiles/facebook` (seed: 12345), không mở song song nhiều browser gây xung đột session hoặc checkpoint.
+- **Hai tab làm việc độc lập:**
+  - `Discovery Tab`: Mở trang Fanpage, cuộn và phát hiện bài viết mới. Tab này được giữ mở và giữ nguyên vị trí cuộn khi chuyển sang trích xuất.
+  - `Extraction Tab`: Mở từng URL bài viết để cào chi tiết caption, like, comment, share, timestamp và đóng/tái sử dụng tuần tự.
+- **Chống trùng lặp & Ràng buộc Scope:** Mọi task được gắn `dataset_scope` (mặc định: `facebook:basketball:nba`). Dữ liệu bóng đá, điền kinh hoặc các nghiên cứu khác lưu trước đó trong SQLite hoàn toàn tách biệt, không bị trộn lẫn vào dataset NBA.
+- **Xuất dữ liệu đồng bộ tuyệt đối:** Cả 3 định dạng `facebook_dataset.csv`, `facebook_dataset.json`, và `facebook_dataset.jsonl` được tạo ra từ **cùng một truy vấn** các bản ghi được chấp nhận (`is_accepted = 1`), ghi qua file tạm `.tmp` và thay thế nguyên tử (`atomic replace`), đảm bảo không có sự sai lệch giữa các file.
 
 ---
 
-## 4. Project Structure
+## 2. Cơ chế điều phối theo lô & Discovery liên tục
+
+Trước đây, quá trình discovery thường phải quét xong toàn bộ Fanpage rồi mới bắt đầu trích xuất, hoặc nếu ngắt giữa chừng thì lần sau phải tải lại từ đầu Fanpage.
+
+### Cải tiến vòng điều phối:
+1. **Khám phá và trích xuất xen kẽ theo lô (`--batch-size 20`):**
+   - Tab Discovery mở Fanpage nguồn **một lần duy nhất**.
+   - Mỗi lượt cuộn, các link bài viết mới được chuẩn hóa (loại bỏ tracking `fbclid`, `ref`...) và ghi ngay lập tức vào SQLite.
+   - Khi phát hiện đủ 20 bài mới (hoặc khi nguồn tạm dừng tiến triển), Discovery tạm nhường quyền điều khiển.
+   - Tab Discovery **vẫn giữ nguyên vị trí cuộn trên trang**, không bị đóng và không gọi `goto()` lại từ đầu trang.
+   - Tab Extraction tiến hành cào dữ liệu cho lô bài trong hàng đợi.
+   - Sau khi hoàn thành lô, Tab Discovery tiếp tục cuộn xuống để tìm các bài cũ hơn.
+2. **Kiểm soát hàng đợi tồn đọng (`--backlog-limit 150`):**
+   - Tránh việc discovery chạy quá xa so với tốc độ trích xuất. Nếu hàng đợi còn hơn 150 task chưa xử lý, discovery sẽ tạm dừng để extraction giải phóng hàng đợi.
+3. **Chuyển nguồn linh hoạt & Giới hạn vòng quét (`--source-max-scrolls 100`):**
+   - Thay thế mức giới hạn cứng 60 vòng quét cũ bằng ngân sách có thể cấu hình.
+   - Khi một nguồn không còn bài mới sau số vòng nghỉ (`--idle-rounds 10`), pipeline ghi nhận trạng thái và chuyển sang nguồn tiếp theo trong file `--pages`.
+   - Nguồn bị dừng do hết thời gian hoặc người dùng ngắt bằng `Ctrl+C` vẫn giữ nguyên điều kiện tiếp tục cho lần chạy sau.
+
+---
+
+## 3. Tiêu chuẩn chất lượng dữ liệu & Bộ lọc NBA
+
+### 3.1. Chính sách bài viết Video / Reel:
+- **Không lấy caption video/reel:** Do đặc thù DOM player của Facebook chèn phụ đề tự động hoặc text rác, các bài viết có `media_type == "video"` được bỏ qua caption (`text = null`), không trích xuất hashtags/mentions/sport.
+- **Tiêu chí chấp nhận:** Bài video được ghi nhận trạng thái kỹ thuật `video_skipped`, **không được chấp nhận** vào dataset bài nghiên cứu NBA (`is_accepted = 0`), và không tính vào mục tiêu số bài NBA hợp lệ.
+
+### 3.2. Bộ lọc NBA dựa trên luật (Rule-Based Classifier):
+Phân loại chính xác dựa trên bằng chứng nội dung, không gọi API ngoài, không suy diễn từ điểm xác suất giả định:
+- **`sport_category`:** Gán `"Basketball"` nếu có bằng chứng bóng rổ.
+- **`competition`:** Xác định giải đấu cụ thể (`"NBA"`).
+- **Quy tắc bắt buộc đã kiểm chứng:**
+  - `NBA Finals: Lakers vs Celtics` $\to$ Nhận diện bằng chứng NBA trực tiếp (`matched`).
+  - Bài viết chỉ về `WNBA`, `EuroLeague`, `VBA`, `FIBA`, `NCAA` $\to$ Bị loại khỏi phạm vi NBA (`unmatched`), dù vẫn là bóng rổ.
+  - Từ `NBA` nằm trong `WNBA` $\to$ Không bị nhận nhầm thành NBA (sử dụng regex `(?<![Ww])\bNBA\b`).
+  - Câu *"I cooked curry for dinner"* $\to$ Không nhận bóng rổ/NBA vì từ `curry` đứng một mình; yêu cầu tên đầy đủ (*Stephen Curry*) hoặc ngữ cảnh bóng rổ đi kèm.
+  - Bài viết chỉ gồm emoji hoặc quá ngắn $\to$ Đánh dấu `uncertain`.
+  - Bài viết tuyển dụng, bán vé, quảng cáo khuyến mãi trên Fanpage NBA nhưng không có nội dung trận đấu $\to$ Đánh dấu `uncertain`.
+  - Game `NBA 2K` $\to$ Loại bỏ (`unmatched`, lý do: nội dung thể thao điện tử/video game).
+  - Giải phát triển `G League` $\to$ Mặc định loại khỏi phạm vi NBA chính (`unmatched`).
+
+### 3.3. Định nghĩa bài viết hợp lệ được chấp nhận (`is_accepted = 1`):
+Một bản ghi chỉ được đưa vào `facebook_dataset.csv`, `facebook_dataset.json`, và `facebook_dataset.jsonl` khi thỏa mãn đồng thời:
+1. Có `post_id` chuỗi hợp lệ, không trùng với bài đã ghi nhận.
+2. Là bài chữ/ảnh (`media_type != "video"`), có caption văn bản không rỗng.
+3. Phân loại NBA đạt `matched`.
+4. Có đầy đủ `post_url`, `published_at` (ISO 8601 có timezone offset), `collected_at`, `sport_category = "Basketball"`.
+5. Có `like_count` hợp lệ (số nguyên $\ge 0$) đo lường tương tác phục vụ nghiên cứu.
+6. Các trường không hiển thị như `view_count` được để `null` (ô trống trong CSV).
+
+---
+
+## 4. Định dạng dữ liệu 17 cột
+
+File xuất tuân thủ chính xác 17 cột, thứ tự và định dạng:
 
 ```text
-playwright-demo/
-├── facebook_pipeline.py          # Unified CLI entry point & SQLite pipeline orchestrator
-├── facebook_dataset.py           # Core extraction engine, DOM parsing, & normalization logic
-├── cloak_facebook_discover.py    # Autonomous Page/Feed URL discovery tool
-├── cloak_facebook_login.py       # Interactive authentication & session keeper
-├── cloak_facebook_posts_auto.py  # Standalone automated crawler (secondary runner)
-├── cloak_facebook_posts.py       # Legacy anchor-assisted extractor (regression testing)
-├── facebook_sports_30_urls.txt   # Valencia Marathon 2022 test dataset (30 target URLs)
-│
-├── tests/
-│   └── test_local_units.py       # Comprehensive unit test suite & DOM fixture isolation test
-│
-├── profiles/
-│   └── facebook/                 # Persistent Chromium profile data (cookies & sessions)
-│
-├── sources/
-│   └── dataset_requirements.xlsx # Reference spreadsheet defining the 17-column specification
-│
-├── output/                       # Generated datasets, logs, and database files
-│   ├── facebook_pipeline.sqlite  # SQLite state tracker for resume and attempt auditing
-│   ├── facebook_pipeline_records.jsonl # Incremental streaming append log
-│   ├── facebook_dataset_auto_*.json    # Final standardized 17-column datasets
-│   └── facebook_posts_auto_debug_*.json# Comprehensive technical debug bundles
-│
-└── legacy/                       # Historical prototype scripts and initial experiments
+post_id, platform, text, published_at, collected_at, author_id,
+language, hashtags, mentions, like_count, comment_count, share_count,
+view_count, media_type, author_followers, post_url, sport_category
+```
+
+- **Mã hóa:** UTF-8-SIG (`utf-8-sig`) giúp hiển thị tốt trên Excel và các công cụ phân tích.
+- **Giá trị null:** Ô trống trong CSV, `null` trong JSON/JSONL.
+- **Định dạng list:** `hashtags` và `mentions` được serialize dạng JSON array string (ví dụ: `["@lakers"]` hoặc `[]`).
+- **ID:** Giữ nguyên chuỗi, không ép kiểu sang số để tránh làm tròn mất ký tự.
+- **Thời gian:** Chuẩn ISO 8601 kèm múi giờ (mặc định Asia/Ho_Chi_Minh: `+07:00`).
+
+---
+
+## 5. Cấu trúc thư mục & Artifacts
+
+Sau khi chạy, thư mục đầu ra (ví dụ: `output/nba_60min/`) chứa các file:
+
+```text
+output/nba_60min/
+├── facebook_pipeline.sqlite       # Cơ sở dữ liệu SQLite quản lý toàn bộ task & state
+├── facebook_dataset.csv          # File CSV chuẩn 17 cột (chỉ chứa bài được chấp nhận)
+├── facebook_dataset.json         # Danh sách JSON bài viết được chấp nhận
+├── facebook_dataset.jsonl        # JSON Lines bài viết được chấp nhận
+├── run_summary.json              # Báo cáo thống kê chi tiết riêng cho phiên chạy hiện tại
+├── quality_report.json           # Tỷ lệ phủ 17 cột, phân bố NBA, thống kê từng nguồn, mẫu đối chiếu
+├── progress.json                 # Cập nhật tiến độ thời gian thực (real-time progress)
+├── pipeline.log                  # Log chi tiết quá trình vận hành
+├── pipeline.lock                 # File khóa ngăn xung đột tiến trình chạy trùng
+└── facebook_posts_auto_debug_*.json # Bản ghi kỹ thuật kiểm toán chi tiết (tự động giữ lại 1 file mới nhất, dọn file cũ)
 ```
 
 ---
 
-## 5. Prerequisites & Authentication Setup
+## 6. Thiết lập môi trường & Đăng nhập
 
-### System Requirements
-- **OS:** macOS (Apple Silicon or Intel)
-- **Python:** 3.10, 3.11, 3.12, or 3.13
-- **Dependencies:** `playwright`, `cloakbrowser`
+### 6.1. Kích hoạt môi trường ảo:
+```bash
+source .venv/bin/activate
+```
 
-### Setup Instructions
-1. **Activate Virtual Environment:**
-   ```bash
-   source .venv/bin/activate
-   ```
-2. **Install Required Packages:**
-   ```bash
-   pip install -r requirements.txt  # or: pip install playwright cloakbrowser pytest
-   playwright install chromium
-   ```
-3. **Authenticate Facebook Profile (One-Time Setup):**
-   Run the interactive login script in headed mode. Complete any 2FA or device approvals in the browser window:
-   ```bash
-   python3 cloak_facebook_login.py
-   ```
-   The authenticated cookies and storage state are saved to `profiles/facebook`. Subsequent automated scripts will reuse this profile headlessly or headed.
+### 6.2. Đăng nhập Facebook (Chỉ thực hiện một lần khi phiên hết hạn):
+Khi gặp thông báo yêu cầu xác minh hoặc checkpoint, chạy script đăng nhập tương tác có giao diện:
+```bash
+python3 cloak_facebook_login.py
+```
+Đăng nhập tài khoản trên cửa sổ trình duyệt hiện ra, hoàn tất xác thực 2 bước (2FA nếu có). Sau khi vào trang chủ Facebook thành công, quay lại Terminal nhấn `Enter` để lưu profile tại `profiles/facebook`.
 
 ---
 
-## 6. Command-Line Interface (CLI) Usage
+## 7. Lệnh chạy thử nghiệm 60 phút (Pilot Benchmark)
 
-The primary entry point is [`facebook_pipeline.py`](file:///Users/dipedetran/Documents/GW/GW_ARL/SocialListening/playwright-demo/facebook_pipeline.py).
+> [!IMPORTANT]
+> **Ràng buộc:** Lệnh này do bạn **chủ động chạy** từ Terminal trên máy của bạn. Agent không tự kích hoạt lệnh này.
 
-### Option A: Process URLs from a File (TXT, JSONL, or CSV)
+Mở Terminal tại thư mục project, giữ máy không ngủ và chạy:
 
-#### 1. Running from a Plain Text List
-Reads one URL per line (ignores blank lines and lines starting with `#`):
 ```bash
-python3 facebook_pipeline.py --urls facebook_sports_30_urls.txt
+caffeinate -i python3 -u facebook_pipeline.py \
+  --pages sources/nba_pages.txt \
+  --sport-hint Basketball \
+  --filter-sport Basketball \
+  --competition NBA \
+  --batch-size 20 \
+  --max-hours 1 \
+  --max-refreshes 0 \
+  --output-dir output/nba_60min
 ```
 
-#### 2. Running a Subset / Batch Limit
-To process only the first 5 pending URLs:
-```bash
-python3 facebook_pipeline.py --urls facebook_sports_30_urls.txt --limit 5
-```
-
-#### 3. Running from a JSONL Discovery File
-Consumes JSONL files produced by `cloak_facebook_discover.py` (extracts `post_url`):
-```bash
-python3 facebook_pipeline.py --urls output/discovered_posts.jsonl
-```
-
-#### 4. Running from a CSV File
-Reads any CSV containing a `post_url`, `url`, or `URL` column:
-```bash
-python3 facebook_pipeline.py --urls sources/posts_to_crawl.csv
-```
+### Giải thích các tham số chính:
+- `caffeinate -i`: Giữ hệ điều hành macOS không rơi vào chế độ sleep trong lúc tác vụ đang chạy (yêu cầu để mở nắp MacBook và cắm sạc).
+- `--pages sources/nba_pages.txt`: Danh sách Fanpage nguồn (mặc định khởi tạo gồm `https://www.facebook.com/nba/`).
+- `--sport-hint Basketball`: Gợi ý ngữ cảnh thể thao phục vụ phân loại.
+- `--filter-sport Basketball`: Lọc bài viết môn bóng rổ khi xuất dữ liệu.
+- `--competition NBA`: Kích hoạt bộ lọc bằng chứng giải đấu NBA.
+- `--batch-size 20`: Discovery tối đa 20 URL mới rồi nhường quyền cho Extraction trích xuất dữ liệu, sau đó Discovery tiếp tục từ vị trí đã cuộn.
+- `--max-hours 1`: Ngân sách thời gian tối đa 60 phút. Hết giờ, pipeline dừng thu thập mới, dành tối đa 20 giây lưu trạng thái và xuất file hoàn chỉnh.
+- `--max-refreshes 0`: Tắt reload trang khi cạn bài (tránh quay lại đầu trang).
+- `--output-dir output/nba_60min`: Toàn bộ database, dataset, log và báo cáo lưu độc lập tại đây.
 
 ---
 
-### Option B: Discover & Crawl Directly from a Facebook Page
+## 8. Lệnh tham khảo cho phiên dài 8 giờ
 
-To crawl the latest posts from a public Facebook Page:
+> [!NOTE]
+> Lệnh này chỉ dùng để tham khảo sau khi đã đánh giá kết quả từ phiên thử 60 phút:
+
 ```bash
-python3 facebook_pipeline.py --page "https://www.facebook.com/maratonvalencia" --limit 10 --sport "Athletics"
+caffeinate -i python3 -u facebook_pipeline.py \
+  --pages sources/nba_pages.txt \
+  --sport-hint Basketball \
+  --filter-sport Basketball \
+  --competition NBA \
+  --batch-size 20 \
+  --max-hours 8 \
+  --max-refreshes 0 \
+  --output-dir output/nba_60min
 ```
+
+Chạy cùng `--output-dir output/nba_60min` sẽ tự động tận dụng danh sách đã cào, hàng đợi và cache của phiên 60 phút trước đó mà không cào lại bài trùng.
 
 ---
 
-### CLI Options Reference
+## 9. Bảng tham số dòng lệnh (CLI Reference)
 
-| Argument | Type | Default | Description |
+| Tham số | Kiểu | Mặc định | Ý nghĩa |
 |---|---|---|---|
-| `--urls` | Path | `None` | Path to TXT, JSONL, or CSV file containing post URLs. |
-| `--page` | URL | `None` | Facebook Page URL to discover and extract posts from. |
-| `--limit` | Integer | `None` | Maximum number of posts to process in the current execution. |
-| `--sport` | String | `None` | Default sport category fallback if not detected from text. |
-| `--retry-failed` | Flag | `False` | Re-queues tasks previously marked with `failed` status. |
-| `--resume` | Flag | `False` | Resumes previous run (default behavior; skips completed tasks). |
-| `--no-followers` | Flag | `False` | Disables author follower scraping for faster throughput. |
-| `--headless` | Flag | `False` | Launches browser in invisible headless mode. |
+| `--pages <file>` | File path | `None` | File chứa danh sách Fanpage Facebook (1 URL/dòng, hỗ trợ `#`). |
+| `--page <url>` | URL | `None` | Thu thập từ 1 Fanpage cụ thể. |
+| `--urls <file>` | File path | `None` | Thu thập từ danh sách URL bài viết có sẵn (.txt, .csv, .jsonl). |
+| `--competition` | String | `NBA` | Phạm vi giải đấu mục tiêu cần khớp bằng chứng. |
+| `--sport-hint` | String | `Basketball` | Gợi ý môn thể thao từ nguồn. |
+| `--filter-sport` | String | `Basketball` | Bộ lọc môn thể thao áp dụng khi xuất dataset. |
+| `--batch-size` | Integer | `20` | Số bài mới phát hiện trước khi chuyển sang trích xuất. |
+| `--max-hours` | Float | `1.0` | Giới hạn thời gian chạy của phiên (tính bằng giờ). |
+| `--source-max-scrolls` | Integer | `100` | Số vòng cuộn tối đa cho mỗi nguồn. |
+| `--idle-rounds` | Integer | `10` | Số vòng cuộn không thấy bài mới trước khi chuyển nguồn. |
+| `--max-refreshes` | Integer | `0` | Số lần reload trang khi cuộn đứng; 0 là tắt reload. |
+| `--backlog-limit` | Integer | `150` | Giới hạn hàng đợi chờ; vượt ngưỡng này discovery tạm dừng. |
+| `--target-valid` | Integer | `None` | Mục tiêu số bài NBA hợp lệ để dừng sớm (nếu muốn). |
+| `--max-attempts` | Integer | `None` | Trần số URL thử xử lý trong phiên. |
+| `--retry-failed` | Flag | `False` | Thử lại các bài từng bị lỗi mạng tạm thời (tối đa 3 lần). |
+| `--no-followers` | Flag | `False` | Bỏ qua bước lấy số follower nếu muốn tối ưu tốc độ. |
+| `--headless` | Flag | `False` | Chạy trình duyệt ở chế độ ẩn. |
+| `--output-dir` | Directory | `output` | Thư mục lưu trữ database, bản xuất và báo cáo. |
 
 ---
 
-## 7. Resumption & Task State Management
+## 10. Kiểm thử offline (Unit & Integration Tests)
 
-All URLs are tracked transactionally in [`output/facebook_pipeline.sqlite`](file:///Users/dipedetran/Documents/GW/GW_ARL/SocialListening/playwright-demo/output/facebook_pipeline.sqlite).
+Toàn bộ hệ thống được kiểm thử offline bằng **pytest**, sử dụng mock, fake page và HTML fixture cục bộ; không thực hiện cuộc gọi mạng hay mở trình duyệt thật ra internet.
 
-### Task Status Lifecycle
-```mermaid
-stateDiagram-v2
-    [*] --> pending: Enqueue URL
-    pending --> processing: Start Scraping
-    processing --> success: Valid Card & Data Extracted
-    processing --> needs_review: Deleted / Private / Unidentifiable Card
-    processing --> failed: Network Error / Timeout
-    failed --> pending: --retry-failed flag passed
-```
-
-- **Resuming:** If a batch is stopped via `Ctrl+C` or a network timeout, simply re-run the same command. Completed tasks (`success` or `needs_review`) are skipped automatically.
-- **Audit Queries:** You can query the status of the pipeline at any time:
-  ```bash
-  sqlite3 output/facebook_pipeline.sqlite "SELECT status, count(*) FROM pipeline_tasks GROUP BY status;"
-  ```
-- **Review Reasons:** Inspect posts requiring manual audit:
-  ```bash
-  sqlite3 output/facebook_pipeline.sqlite "SELECT input_url, review_reasons FROM pipeline_tasks WHERE status = 'needs_review';"
-  ```
-
----
-
-## 8. Automated Verification & Unit Testing
-
-The repository includes a dedicated test suite in [`tests/test_local_units.py`](file:///Users/dipedetran/Documents/GW/GW_ARL/SocialListening/playwright-demo/tests/test_local_units.py) that validates core algorithms locally without hitting Facebook servers:
-
+Chạy kiểm thử:
 ```bash
-python3 -m pytest tests/test_local_units.py -v
+python3 -m pytest tests/ -v
 ```
 
-### Verified Test Cases
-1. `test_unicode_and_vietnamese_diacritics_regex`: Validates matching on Mathematical Sans-serif Bold Unicode (`𝐌𝐨𝐮𝐫𝐢𝐧𝐡𝐨`) and accented Vietnamese text without regex compilation errors.
-2. `test_numeric_count_normalization`: Validates multi-lingual abbreviation parsing (`1.2K`, `1,2K`, `1,234`, `1.234`, `1,2 nghìn`) and ensures approximate values are flagged.
-3. `test_timestamp_standardization`: Validates English and Spanish date parsing into ISO 8601 strings and rejects relative times (*"2 h"*, *"3y"*).
-4. `test_sport_category_normalization`: Validates synonyms mapping (*"marathon"*, *"maratón"*, *"atletismo"* $\to$ `"Athletics"`).
-5. `test_language_detection`: Validates distinct classification of `es`, `en`, `vi`, and fallback to `unknown`.
-6. `test_sqlite_pipeline_resumption`: Validates database insertion, deduplication, and pending task retrieval.
-7. `test_dom_fixture_isolation_comments_and_sidebars`: Spawns a headless Playwright instance against an HTML fixture containing adjacent posts and comment sections, verifying zero text leakage into the extracted caption.
+### Kết quả kiểm thử đạt 30/30 tests:
+- `tests/test_local_units.py`: 16 tests về chuẩn hóa số liệu đa ngôn ngữ, timezone ISO 8601, tách biệt caption khỏi comment/sidebar, trích xuất mention và ID.
+- `tests/test_nba_pipeline.py`: 14 tests bao quát 12 tiêu chí nghiệm thu:
+  1. Trích xuất caption chữ/ảnh không lỗi biến `UnboundLocalError`.
+  2. Bỏ qua caption bài video và loại khỏi dataset nghiên cứu.
+  3. Phân lập vùng DOM bài viết, không lẫn gợi ý và bình luận.
+  4. Bộ lọc NBA: phân biệt Lakers/Celtics, loại WNBA/VBA/EuroLeague, loại curry ăn tối, nhận Stephen Curry, loại game 2K/G-League.
+  5. Chuẩn hóa URL, loại bỏ tracking tham số `fbclid`, chống trùng permalink.
+  6. Ghi nhận URL discovery tức thì vào SQLite.
+  7. Discovery session phân lô mà không reload trang từ đầu.
+  8. Phục hồi task `processing` sau crash thành `pending`.
+  9. Kiểm soát thời gian bằng monotonic deadline.
+  10. Phát hiện checkpoint / màn hình đăng nhập để dừng phiên an toàn.
+  11. Phân vùng scope SQLite, bảo vệ dữ liệu cũ không bị lẫn vào NBA dataset.
+  12. Tính nhất quán tuyệt đối giữa CSV, JSON và JSONL; cache follower theo TTL.
 
 ---
 
-## 9. Output Artifacts & File Formats
+## 11. Xử lý sự cố & Phiên đăng nhập (Troubleshooting)
 
-### 1. Standard 17-Column Output (`output/facebook_dataset_auto_*.json`)
-```json
-[
-  {
-    "post_id": "pfbid08xPjdDRwefEd1okepwWdUqBDAcGUL8PLt46GMVUotuiZPzNt2B7kR12PrQ6TTv2Vl",
-    "platform": "Facebook",
-    "text": "Las 12 campanadas del atletismo \n en 2022 \n 𝐑𝐮𝐭𝐚\nDicen que recordar es volver a vivir...",
-    "published_at": "2022-12-29T22:32:00+07:00",
-    "collected_at": "2026-10-15T18:01:25.641659+00:00",
-    "author_id": "atletismoRFEA",
-    "language": "es",
-    "hashtags": [],
-    "mentions": [],
-    "like_count": 44,
-    "comment_count": 2,
-    "share_count": 6,
-    "view_count": null,
-    "media_type": "image",
-    "author_followers": 88000,
-    "post_url": "https://www.facebook.com/atletismoRFEA/posts/pfbid08xPjdDRwefEd1okepwWdUqBDAcGUL8PLt46GMVUotuiZPzNt2B7kR12PrQ6TTv2Vl#",
-    "sport_category": "Athletics"
-  }
-]
-```
-
-### 2. Technical Debug Output (`output/facebook_posts_auto_debug_*.json`)
-Contains low-level diagnostic attributes:
-- `raw_timestamp`: Exact unparsed tooltip string (e.g., `"Friday 30 December 2022 at 01:52"`).
-- `time_precision`: Indicates whether timestamp is `"exact"` or `"insufficient_evidence"`.
-- `counts_meta`: Metadata flags such as `is_approximate: true` for abbreviations like `"1.2K"`.
-- `review_reasons`: Explanatory logs for any cards marked with `needs_review`.
-
----
-
-## 10. Troubleshooting & Best Practices
-
-- **Throughput & Delays:** Each post takes approximately **10–12 seconds** to process. This includes DOM stabilization, clicking "See more", hovering to trigger native date tooltips, and resolving author followers in a background tab. Do not reduce these delays as they ensure anti-bot safety.
-- **Handling Redirects:** Object URLs formatted as `https://www.facebook.com/<numeric_id>` are automatically navigated and resolved to their canonical permalinks (`/posts/pfbid...`). The numeric ID is never mistaken for the author ID.
-- **SingletonLock Conflicts:** If a previous process terminated unexpectedly, `clean_profile_locks()` automatically inspects the PID associated with `profiles/facebook/SingletonLock`. If the process is no longer active, the lock file is safely unlinked.
-- **Session Expiration:** If Facebook requires authentication or displays a checkpoint, the pipeline halts immediately with exit code `2`, saving all completed tasks to SQLite. Run `python3 cloak_facebook_login.py` to refresh the session and re-run the pipeline.
+- **Khi gặp checkpoint hoặc bắt đăng nhập:** Pipeline tự động lưu tiến độ vào SQLite và thoát với mã cảnh báo rõ ràng. Hãy chạy `python3 cloak_facebook_login.py` để đăng nhập lại trên trình duyệt, sau đó tiếp tục chạy lệnh pipeline với cùng `--output-dir`.
+- **Tạm dừng bằng `Ctrl+C`:** Toàn bộ task đã hoàn thành được commit ngay lập tức vào database, file CSV/JSON/JSONL được cập nhật đến thời điểm dừng.
+- **Tiến trình chạy trùng lặp:** Hệ thống sử dụng file `pipeline.lock`. Nếu có tiến trình khác đang chạy cùng profile/output, chương trình sẽ từ chối chạy để bảo vệ dữ liệu.
