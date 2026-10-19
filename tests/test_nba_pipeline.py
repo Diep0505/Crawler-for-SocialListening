@@ -134,6 +134,55 @@ class TestNBAPipelineOffline(unittest.TestCase):
         self.assertNotIn("Comment 1", res["text"])
         self.assertNotIn("Suggested for you", res["text"])
 
+    def test_dom_fixture_rejects_notification_toast_dialog(self):
+        """Verifies that SCOPED_EXTRACTION_JS ignores notification toasts/dialogs and targets the actual post."""
+        from playwright.sync_api import sync_playwright
+
+        html_with_toast = """
+        <html>
+          <body>
+            <!-- Persistent Facebook notification dialog/toast -->
+            <div role="dialog" aria-label="Notifications">
+              <a href="https://www.facebook.com/reel/123456?story_fbid=987654321">Reel</a>
+              <div dir="auto">
+                UnreadNam Nhat, Nguyễn Thức and 7 other people recently reacted to your reel: "AI nghe thì xịn, nhưng ứng dụng vào đời..."
+              </div>
+            </div>
+
+            <!-- Target NBA Post in Main -->
+            <div role="main">
+              <div id="target-post" role="article">
+                <a href="/nba/posts/pfbid02Fa" role="link" aria-label="Saturday, October 17, 2026 at 10:00 AM">NBA</a>
+                <div data-ad-preview="message">
+                  <span>Stephen Curry hits 8 three-pointers in stunning preseason victory!</span>
+                </div>
+                <div role="toolbar">
+                  <span aria-label="42K reactions">42K</span>
+                  <span aria-label="850 comments">850</span>
+                  <span aria-label="300 shares">300</span>
+                </div>
+              </div>
+            </div>
+          </body>
+        </html>
+        """
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_content(html_with_toast)
+            res = page.evaluate(fd.SCOPED_EXTRACTION_JS, "https://www.facebook.com/nba/posts/pfbid02Fa")
+            browser.close()
+
+        self.assertTrue(res["card_found"])
+        self.assertIn("Stephen Curry hits 8 three-pointers", res["text"])
+        self.assertNotIn("UnreadNam Nhat", res["text"])
+        self.assertNotIn("reacted to your reel", res["text"])
+        self.assertEqual(res["like_count_raw"], "42K")
+        self.assertEqual(res["comment_count_raw"], "850")
+        self.assertEqual(res["share_count_raw"], "300")
+        self.assertEqual(res["published_at_raw"], "Saturday, October 17, 2026 at 10:00 AM")
+
+
     # -------------------------------------------------------------
     # 3. Phân loại NBA (NBA Competition Classifier)
     # -------------------------------------------------------------

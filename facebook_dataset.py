@@ -1993,16 +1993,62 @@ SCOPED_EXTRACTION_JS = r"""(postUrl) => {
     let card = null;
     let msg = null;
 
+    // Dismiss floating chat tabs or notification toasts if present
+    try {
+        const closeBtns = Array.from(document.querySelectorAll('[aria-label="Close chat" i], [aria-label="Đóng đoạn chat" i], [aria-label="Close" i][role="button"], [aria-label="Đóng" i][role="button"]'));
+        for (const b of closeBtns) {
+            const dlg = b.closest('[role="dialog"]');
+            if (dlg && /chat|tin nhắn|trò chuyện|messenger|thông báo|notification/i.test((dlg.getAttribute('aria-label') || '') + ' ' + (dlg.innerText || ''))) {
+                try { b.click(); } catch(e) {}
+            }
+        }
+    } catch(e) {}
+
+    // Helper: test if an element looks like a notification / chat / toast popup to be rejected
+    const isNotificationOrChat = (el) => {
+        if (!el) return false;
+        const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+        const ariaLabelledby = (el.getAttribute('aria-labelledby') || '').toLowerCase();
+        const combined = ariaLabel + ' ' + ariaLabelledby;
+        if (/notifications|thông báo|chat|tin nhắn|messenger|trò chuyện/i.test(combined)) {
+            return true;
+        }
+        const text = (el.innerText || '').toLowerCase();
+        if (/reacted to your|bày tỏ cảm xúc về|commented on your|đã bình luận về|shared your|chia sẻ bài viết của bạn|nhắc đến bạn trong|mentioned you in/i.test(text)) {
+            return true;
+        }
+        if (el.closest('[role="alert"], [data-pagelet*="Toast"], [aria-live="polite"], [aria-live="assertive"]')) {
+            return true;
+        }
+        return false;
+    };
+
     // 0. Priority: If post is displayed inside a modal dialog [role="dialog"], use the dialog container!
-    const postDialogs = Array.from(document.querySelectorAll('[role="dialog"]')).filter(d => 
-        d.querySelector('div[data-ad-preview="message"], div[data-ad-comet-preview="message"]') ||
-        d.querySelector('a[href*="/posts/"], a[href*="permalink.php"], a[href*="story_fbid="]')
-    );
+    const postDialogs = Array.from(document.querySelectorAll('[role="dialog"]')).filter(d => {
+        if (isNotificationOrChat(d)) return false;
+        const hasToolbar = Boolean(d.querySelector('[role="toolbar"], [aria-label*="reactions" i], [aria-label*="Like" i], [aria-label*="Thích" i]'));
+        if (!hasToolbar) return false;
+        const hasPostEvidence = d.querySelector('div[data-ad-preview="message"], div[data-ad-comet-preview="message"]') ||
+                                d.querySelector('a[href*="/posts/"], a[href*="permalink.php"], a[href*="story_fbid="]');
+        return Boolean(hasPostEvidence);
+    });
+
     if (postDialogs.length > 0) {
-        card = postDialogs[0];
+        if (postUrl) {
+            const cleanPath = postUrl.replace(/^https?:\/\/(www\.)?facebook\.com\/?/, '').split('?')[0].replace(/\/$/, '');
+            const matchingDlg = postDialogs.find(d => {
+                const anchors = Array.from(d.querySelectorAll('a[href]'));
+                return anchors.some(a => (a.href || '').includes(cleanPath));
+            });
+            if (matchingDlg) card = matchingDlg;
+        }
+        if (!card) {
+            const withMsg = postDialogs.find(d => d.querySelector('div[data-ad-preview="message"], div[data-ad-comet-preview="message"]'));
+            card = withMsg || postDialogs[0];
+        }
     }
 
-    // 1a. If postUrl is provided, match anchor matching the permalink/ID first
+    // 1a. If postUrl is provided and card not found in dialog, match anchor matching the permalink/ID
     if (!card && postUrl) {
         const cleanPath = postUrl.replace(/^https?:\/\/(www\.)?facebook\.com\/?/, '').split('?')[0].replace(/\/$/, '');
         const allAnchors = Array.from(document.querySelectorAll('a[href]'));
@@ -2011,6 +2057,10 @@ SCOPED_EXTRACTION_JS = r"""(postUrl) => {
             if (cleanPath && h.includes(cleanPath)) {
                 let curr = a;
                 while (curr && curr !== document.body) {
+                    if (isNotificationOrChat(curr)) {
+                        curr = null;
+                        break;
+                    }
                     if (curr.querySelector('[role="toolbar"], [aria-label*="reactions" i], [aria-label*="Like" i]')) {
                         card = curr;
                         break;
@@ -2022,11 +2072,11 @@ SCOPED_EXTRACTION_JS = r"""(postUrl) => {
         }
     }
 
-    // 1b. Fallback: match first message container with its toolbar ancestor
+    // 1b. Match first message container with its toolbar ancestor
     if (!card) {
-        msg = document.querySelector('div[data-ad-preview="message"], div[data-ad-comet-preview="message"]');
-        if (msg) {
-            let curr = msg;
+        const candidateMsgs = Array.from(document.querySelectorAll('div[data-ad-preview="message"], div[data-ad-comet-preview="message"]')).filter(m => !isNotificationOrChat(m));
+        if (candidateMsgs.length > 0) {
+            let curr = candidateMsgs[0];
             while (curr && curr !== document.body) {
                 if (curr.querySelector('[role="toolbar"], [aria-label*="reactions" i], [aria-label*="Like" i]')) {
                     card = curr;
@@ -2041,6 +2091,7 @@ SCOPED_EXTRACTION_JS = r"""(postUrl) => {
     if (!card) {
         const main = document.querySelector('[role="main"]') || document.body;
         const postLink = Array.from(main.querySelectorAll('a')).find(a => {
+            if (isNotificationOrChat(a)) return false;
             const h = a.href || '';
             if (h.includes('comment_id=')) return false;
             if (a.closest('[role="article"]') && a.closest('[role="article"]').getAttribute('aria-label')?.toLowerCase().includes('comment')) return false;
@@ -2082,7 +2133,9 @@ SCOPED_EXTRACTION_JS = r"""(postUrl) => {
     } else {
         const textNodes = Array.from(card.querySelectorAll('div[dir="auto"], span[dir="auto"]')).filter(d => {
             if (d.closest('[role="toolbar"]') || d.closest('[role="article"]') || d.closest('form')) return false;
+            if (isNotificationOrChat(d)) return false;
             const t = (d.innerText || '').trim();
+            if (/reacted to your|bày tỏ cảm xúc|commented on your|đã bình luận|shared your|nhắc đến bạn/i.test(t)) return false;
             return t.length > 20;
         });
         textNodes.sort((a, b) => (b.innerText || '').length - (a.innerText || '').length);
@@ -2169,8 +2222,29 @@ SCOPED_EXTRACTION_JS = r"""(postUrl) => {
             if (m) res.like_count_raw = m[1];
         }
     }
+    if (!res.like_count_raw) {
+        const likeBtn = card.querySelector('[role="button"][aria-label*="Like" i], [role="button"][aria-label*="Thích" i]');
+        if (likeBtn) {
+            const m = (likeBtn.innerText || '').match(/\b([\d.,]+[KkMmB]?|\d+)\b/);
+            if (m) res.like_count_raw = m[1];
+        }
+    }
 
     // 5.2 Comments
+    if (!res.comment_count_raw) {
+        const commentEl = card.querySelector('[aria-label*="comment" i], [aria-label*="bình luận" i], [aria-label*="comentario" i]');
+        if (commentEl) {
+            const m = (commentEl.getAttribute('aria-label') || '').match(/([\d.,]+[KkMmB]?|\d+)/);
+            if (m) res.comment_count_raw = m[1];
+        }
+    }
+    if (!res.comment_count_raw) {
+        const commentBtn = card.querySelector('[role="button"][aria-label*="comment" i], [role="button"][aria-label*="bình luận" i]');
+        if (commentBtn) {
+            const m = (commentBtn.innerText || '').match(/\b([\d.,]+[KkMmB]?|\d+)\b/);
+            if (m) res.comment_count_raw = m[1];
+        }
+    }
     const cardText = card.innerText || '';
     if (!res.comment_count_raw) {
         const cMatch = cardText.match(/\b(\d[\d.,]*[KkMmB]?)\s+(?:comments?|bình luận|comentarios)\b/i);
@@ -2182,6 +2256,20 @@ SCOPED_EXTRACTION_JS = r"""(postUrl) => {
     }
 
     // 5.3 Shares
+    if (!res.share_count_raw) {
+        const shareEl = card.querySelector('[aria-label*="share" i], [aria-label*="lượt chia sẻ" i], [aria-label*="compartido" i]');
+        if (shareEl) {
+            const m = (shareEl.getAttribute('aria-label') || '').match(/([\d.,]+[KkMmB]?|\d+)/);
+            if (m) res.share_count_raw = m[1];
+        }
+    }
+    if (!res.share_count_raw) {
+        const shareBtn = card.querySelector('[role="button"][aria-label*="share" i], [role="button"][aria-label*="chia sẻ" i]');
+        if (shareBtn) {
+            const m = (shareBtn.innerText || '').match(/\b([\d.,]+[KkMmB]?|\d+)\b/);
+            if (m) res.share_count_raw = m[1];
+        }
+    }
     if (!res.share_count_raw) {
         const sMatch = cardText.match(/\b(\d[\d.,]*[KkMmB]?)\s+(?:shares?|lượt chia sẻ|veces compartido)\b/i);
         if (sMatch) res.share_count_raw = sMatch[1];
@@ -2402,6 +2490,13 @@ def extract_scoped_post_data(
             extracted_text,
             flags=re.IGNORECASE,
         ).strip()
+
+        # Quality guard: reject notification toast phrases leaking into text
+        if re.search(r"(?:reacted to your|bày tỏ cảm xúc về|commented on your|đã bình luận về|shared your reel|shared your post)", extracted_text, re.IGNORECASE):
+            logger.warning(f"Notification toast text detected and discarded for {url}: {extracted_text[:60]}...")
+            extracted_text = None
+            dom_res["text"] = None
+            dom_res["review_reasons"].append("Extracted text matched notification toast pattern; discarded.")
 
     normalized_sport, sport_meta = classify_post_sport(
         extracted_text,
