@@ -512,8 +512,9 @@ class TestNBAPipelineOffline(unittest.TestCase):
     def test_safe_entry_point_does_not_open_browser_on_import_or_help(self):
         """Verifies that importing modules or running --help does not trigger browser launch."""
         import subprocess
+        import sys
         res = subprocess.run(
-            ["python3", "facebook_pipeline.py", "--help"],
+            [sys.executable, "facebook_pipeline.py", "--help"],
             capture_output=True,
             text=True,
             cwd=str(fp.BASE_DIR),
