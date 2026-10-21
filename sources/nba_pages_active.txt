@@ -1,0 +1,122 @@
+# nba_pages_active.txt
+# Pruned source list — generated 2026-10-21
+# Basis: quality_report.json from run_20261018T172258_470026Z (90 sources, ~5.5h)
+# Kept  : 47 sources with discovered_urls > 0 in the benchmark run
+# Removed: 43 sources with discovered_urls = 0 (idle_rounds_exhausted, FanSided team blogs)
+# Added  : 8 new high-value sources previously listed as comments in nba_pages.txt
+# Total  : 55 active + high-priority sources
+#
+# USAGE:
+#   caffeinate -i python3 -u facebook_pipeline.py \
+#     --pages sources/nba_pages_active.txt \
+#     --sport-hint Basketball --filter-sport Basketball \
+#     --competition NBA --batch-size 20 --max-hours 8 \
+#     --output-dir output/nba_60min
+
+# ============================================================
+# TIER 1: Official NBA Team Pages (Verified high yield)
+# ============================================================
+https://www.facebook.com/losangeleslakers/
+https://www.facebook.com/warriors/
+https://www.facebook.com/celtics/
+https://www.facebook.com/suns/
+https://www.facebook.com/losangelesclippers/
+https://www.facebook.com/hornets/
+https://www.facebook.com/detroitpistons/
+https://www.facebook.com/trailblazers/
+https://www.facebook.com/brooklynnets/
+https://www.facebook.com/Wizards/
+https://www.facebook.com/utahjazz/
+https://www.facebook.com/PelicansNBA/
+
+# ============================================================
+# TIER 2: Major NBA Media & Community Pages (EN)
+# ============================================================
+# ClutchPoints [TOP PRODUCER: 192 posts in DB]
+https://www.facebook.com/ClutchPoints/
+# Basketball Forever [TOP PRODUCER: 201 posts in DB]
+https://www.facebook.com/basketballforever/
+# Golden State of Mind [TOP PRODUCER: 279 posts in DB]
+https://www.facebook.com/GoldenStateofMind/
+# Bleacher Report Hoops
+https://www.facebook.com/BleacherReportHoops/
+# ESPN NBA
+https://www.facebook.com/espnnba/
+# SLAM Magazine [active yield: 20 URLs]
+https://www.facebook.com/SLAMMagazine/
+# Blazer's Edge [active yield: 175 posts in DB]
+https://www.facebook.com/Blazersedge/
+# Clips Nation [active yield: 28 URLs]
+https://www.facebook.com/clipsnation/
+# Beale Street Bears [active yield: 27 URLs]
+https://www.facebook.com/BealeStreetBears/
+# Heat Nation [active yield: 37 URLs]
+https://www.facebook.com/HeatNation/
+# Raptors Nation [active yield: 36 URLs]
+https://www.facebook.com/RaptorsNation/
+# Air Alamo [active yield: 20 URLs]
+https://www.facebook.com/AirAlamo/
+https://www.facebook.com/NBATV/
+https://www.facebook.com/NBAIndia/
+https://www.facebook.com/NBAPhilippines/
+https://www.facebook.com/NBAArabic/
+https://www.facebook.com/DunkingWithWolves/
+https://www.facebook.com/BehindTheBuckPass/
+https://www.facebook.com/BasketSession/
+https://www.facebook.com/Basket4US/
+https://www.facebook.com/swarmandsting/
+https://www.facebook.com/AtTheHive/
+https://www.facebook.com/HotHotHoops/
+https://www.facebook.com/ParlonsBasketNBA/
+https://www.facebook.com/BasketNews/
+https://www.facebook.com/Sportando/
+# Eurohoops [active yield: 19 URLs]
+https://www.facebook.com/Eurohoopsnet/
+
+# ============================================================
+# TIER 3: Vietnamese NBA Sources (VI)
+# ============================================================
+# ballerstalkVN [active yield: 30 URLs]
+https://www.facebook.com/ballerstalkVN/
+# bongrotv [active yield: 25 URLs]
+https://www.facebook.com/bongrotv/
+# nbavietnam [active yield: 6 URLs]
+https://www.facebook.com/nbavietnam/
+# Bongrovietnam [active yield: 5 URLs]
+https://www.facebook.com/Bongrovietnam/
+# FPTBongRo [active yield: 4 URLs]
+https://www.facebook.com/FPTBongRo/
+
+# ============================================================
+# TIER 4: International (FR / ES / IT / PT / DE)
+# ============================================================
+# BasketUSA FR [active yield: 21 URLs]
+https://www.facebook.com/BasketUSA/
+# TrashTalk FR [active yield: 19 URLs]
+https://www.facebook.com/trashtalk.fr/
+# NbaPassionCom IT [active yield: 19 URLs]
+https://www.facebook.com/NbaPassionCom/
+# NbaReligion IT [active yield: 30 URLs]
+https://www.facebook.com/NbaReligion/
+# DunkestFantasyBasketball IT [active yield: 7 URLs]
+https://www.facebook.com/DunkestFantasyBasketball/
+# NBAMexico ES [active yield: 5 URLs]
+https://www.facebook.com/NBAMexico/
+# NBALatam ES [active yield: 16 URLs]
+https://www.facebook.com/NBALatam/
+# gigantesdelbasket ES [active yield: 25 URLs]
+https://www.facebook.com/gigantesdelbasket/
+# NBABrasil PT [active yield: 2 URLs]
+https://www.facebook.com/NBABrasil/
+https://www.facebook.com/bolapresa/
+https://www.facebook.com/www.basketball.de/
+
+# ============================================================
+# TIER 5: Numeric profile.php sources (verified active)
+# ============================================================
+# Basket Infos FR [active yield: 20 URLs]
+https://www.facebook.com/profile.php?id=100080963756070
+# NBA Time TH [active yield: 4 URLs]
+https://www.facebook.com/profile.php?id=100064447792032
+# NBA Taiwan ZH [active yield: 1 URL]
+https://www.facebook.com/nba.taiwan/

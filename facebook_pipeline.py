@@ -121,6 +121,9 @@ class PipelineDB:
                     canonical_url TEXT,
                     post_id TEXT,
                     author_id TEXT,
+                    platform TEXT DEFAULT 'Facebook',
+                    source_type TEXT DEFAULT 'fanpage',
+                    sport_category TEXT,
                     status TEXT DEFAULT 'pending',
                     attempts INTEGER DEFAULT 0,
                     last_error TEXT,
@@ -171,9 +174,16 @@ class PipelineDB:
                 self.conn.execute("ALTER TABLE pipeline_tasks ADD COLUMN is_accepted INTEGER DEFAULT 0")
             if "run_id" not in cols:
                 self.conn.execute("ALTER TABLE pipeline_tasks ADD COLUMN run_id TEXT")
+            if "platform" not in cols:
+                self.conn.execute("ALTER TABLE pipeline_tasks ADD COLUMN platform TEXT DEFAULT 'Facebook'")
+            if "source_type" not in cols:
+                self.conn.execute("ALTER TABLE pipeline_tasks ADD COLUMN source_type TEXT DEFAULT 'fanpage'")
+            if "sport_category" not in cols:
+                self.conn.execute("ALTER TABLE pipeline_tasks ADD COLUMN sport_category TEXT")
 
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_scope ON pipeline_tasks(dataset_scope)")
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_accepted ON pipeline_tasks(is_accepted)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_platform ON pipeline_tasks(platform)")
 
     def recover_interrupted_tasks(self, dataset_scope=None):
         """Resets any 'processing' tasks left behind by crashed or interrupted sessions back to 'pending'."""
@@ -240,6 +250,53 @@ class PipelineDB:
                    (input_url, canonical_url, post_id, dataset_scope, status, attempts, created_at, updated_at) 
                    VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)""",
                 (normalized, normalized, post_id, dataset_scope, now, now),
+            )
+            return cur.rowcount > 0
+
+    def enqueue_discovered_post(self, post_data, dataset_scope=None):
+        """Enqueues a discovered post from any platform/source directly into SQLite.
+        Accepts a dict or DiscoveredPost object.
+        """
+        if hasattr(post_data, "to_dict"):
+            data = post_data.to_dict()
+        elif isinstance(post_data, dict):
+            data = post_data
+        else:
+            return False
+
+        post_url = data.get("url") or data.get("post_url")
+        if not post_url:
+            return False
+
+        platform = data.get("platform", "Facebook")
+        if str(platform).lower() == "facebook":
+            normalized = fd.normalize_facebook_post_url(post_url)
+            post_id = data.get("post_id") or fd.extract_post_id(normalized)
+        else:
+            normalized = post_url.strip()
+            post_id = data.get("post_id")
+
+        if post_id and self.is_post_completed(post_id):
+            return False
+
+        source_type = data.get("source_type", "fanpage")
+        sport_category = data.get("sport") or data.get("sport_category")
+        competition = data.get("competition")
+        author_id = data.get("author_id")
+
+        if not dataset_scope:
+            plat_s = str(platform).lower()
+            sport_s = (sport_category or "sport").lower()
+            comp_s = (competition or "general").lower()
+            dataset_scope = f"{plat_s}:{sport_s}:{comp_s}"
+
+        now = datetime.now(timezone.utc).isoformat()
+        with self.conn:
+            cur = self.conn.execute(
+                """INSERT OR IGNORE INTO pipeline_tasks 
+                   (input_url, canonical_url, post_id, author_id, platform, source_type, sport_category, competition, dataset_scope, status, attempts, created_at, updated_at) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)""",
+                (normalized, normalized, post_id, author_id, platform, source_type, sport_category, competition, dataset_scope, now, now),
             )
             return cur.rowcount > 0
 

@@ -1697,6 +1697,7 @@ def build_dataset_record(
     language=None,
     hashtags=None,
     mentions=None,
+    platform="Facebook",
 ):
     """Builds a standardized 17-column dataset record with exact schema compliance."""
     final_post_id = post_id or extract_post_id(post_url)
@@ -1746,7 +1747,7 @@ def build_dataset_record(
 
     record = {
         "post_id": str(final_post_id) if final_post_id is not None else None,
-        "platform": "Facebook",
+        "platform": str(platform or "Facebook"),
         "text": final_text,
         "published_at": published_at,
         "collected_at": final_collected_at,
@@ -2430,6 +2431,64 @@ def extract_scoped_post_data(
             "ts_coords": None,
             "review_reasons": [f"DOM evaluation failed: {exc}"],
         }
+
+    # --- like_count retry: Facebook sometimes lazy-renders the reaction badge ---
+    # If like_count_raw is still None after initial DOM eval, wait progressively
+    # and re-probe the reaction badge only (lightweight JS, no full re-eval).
+    # Up to 3 retries with increasing wait: 1.2s → 2.0s → 3.0s.
+    _LIKE_RETRY_WAITS_MS = [1200, 2000, 3000]
+    _LIKE_RETRY_JS = r"""
+    (function() {
+        // Lightweight re-probe for reaction badge only
+        const reactionSelectors = [
+            '[aria-label*="reaction"][aria-label*=" "]',
+            'span[class*="x1e558r4"]',
+            'span[class*="xt0psk2"]',
+        ];
+        for (const sel of reactionSelectors) {
+            const els = Array.from(document.querySelectorAll(sel));
+            for (const el of els) {
+                if (el.closest('ul, [role="article"] [role="article"]')) continue;
+                const aria = (el.getAttribute('aria-label') || '').trim();
+                const txt = (el.innerText || '').trim();
+                const m = aria.match(/^([\d.,]+[KkMmBb]?)\s+/i) || txt.match(/^([\d.,]+[KkMmBb]?)$/i);
+                if (m) return m[1];
+                // reaction badge pattern: "1.2K reactions" / "708 reactions"
+                const m2 = (aria + ' ' + txt).match(/([\d.,]+[KkMmBb]?)\s*(?:reaction|reac|lượt bày tỏ)/i);
+                if (m2) return m2[1];
+            }
+        }
+        // Broader fallback: find any span near a reaction emoji group
+        const emojiGroups = document.querySelectorAll(
+            '[aria-label*="Like"], [aria-label*="Love"], [aria-label*="Haha"], [aria-label*="Wow"]'
+        );
+        for (const eg of emojiGroups) {
+            const parent = eg.closest('[role="group"], div') || eg.parentElement;
+            if (!parent) continue;
+            const spans = parent.querySelectorAll('span');
+            for (const sp of spans) {
+                const t = (sp.innerText || '').trim();
+                if (/^[\d.,]+[KkMmBb]?$/.test(t)) return t;
+            }
+        }
+        return null;
+    })()
+    """
+    if dom_res.get("card_found") and not dom_res.get("like_count_raw"):
+        for _retry_idx, _wait_ms in enumerate(_LIKE_RETRY_WAITS_MS, start=1):
+            try:
+                page.wait_for_timeout(_wait_ms)
+                _retried_like = page.evaluate(_LIKE_RETRY_JS)
+                if _retried_like:
+                    dom_res["like_count_raw"] = _retried_like
+                    logger.debug(
+                        f"like_count retry #{_retry_idx} succeeded for {url}: raw='{_retried_like}'"
+                    )
+                    break
+                logger.debug(f"like_count retry #{_retry_idx} — badge still not rendered for {url}")
+            except Exception as _exc:
+                logger.debug(f"like_count retry #{_retry_idx} error for {url}: {_exc}")
+                break
 
     raw_published = dom_res.get("published_at_raw")
     ts_coords = dom_res.get("ts_coords")
