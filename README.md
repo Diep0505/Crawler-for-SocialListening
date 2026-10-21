@@ -258,14 +258,15 @@ playwright-demo/
 
 ## 7. Thiết lập môi trường & Đăng nhập
 
-### 7.1. Kích hoạt môi trường ảo:
+### 7.1. Khởi tạo & Kích hoạt môi trường ảo:
 ```bash
+python3 -m venv .venv
 source .venv/bin/activate
 ```
 
 ### 7.2. Cài đặt phụ thuộc:
 ```bash
-pip install playwright twscrape pytest
+pip install -r requirements.txt
 playwright install chromium
 ```
 

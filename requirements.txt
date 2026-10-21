@@ -1,0 +1,16 @@
+# Core Automation & Scraping Engines
+playwright>=1.40.0
+cloakbrowser>=0.6.2
+twscrape>=0.20.0
+
+# Language Detection & Parsing
+lingua-language-detector>=2.0.0
+beautifulsoup4>=4.12.0
+fake-useragent>=2.0.0
+
+# Database & Logging
+aiosqlite>=0.20.0
+loguru>=0.7.0
+
+# Testing
+pytest>=8.0.0
