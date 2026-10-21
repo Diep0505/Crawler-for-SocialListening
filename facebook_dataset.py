@@ -1715,8 +1715,8 @@ def build_dataset_record(
 
     final_media_type = media_type or "text"
 
-    # For video posts, omit caption text, language, hashtags, mentions, and sport due to video player DOM quirks
-    if final_media_type == "video":
+    # For Facebook video posts, omit caption text, language, hashtags, mentions, and sport due to video player DOM quirks
+    if final_media_type == "video" and str(platform or "Facebook").lower() == "facebook":
         final_text = None
         final_language = None
         final_hashtags = []

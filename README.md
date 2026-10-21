@@ -1,96 +1,172 @@
-# Facebook NBA Social Listening & Dataset Collection Pipeline
+# Multi-Platform Sport Social Listening & Dataset Collection Pipeline
 
-A production-grade, automated, and resumable social listening pipeline for discovering and extracting Facebook posts, engagement metrics, verified timestamps, author metadata, and strict NBA competition evidence into a standard 17-column dataset format.
+A production-grade, automated, and resumable social listening pipeline for discovering and extracting social media posts, engagement metrics, verified timestamps, author metadata, and strict competition evidence into a standard **17-column dataset schema** across **Facebook**, **X (Twitter)**, **Instagram**, and **Threads**.
 
-Built with **Python**, **Playwright**, **CloakBrowser** (stealth anti-detection browser engine), and **SQLite** on macOS Apple Silicon.
+Built with **Python 3**, **Playwright**, **CloakBrowser** (stealth anti-detection browser engine), **twscrape** (GraphQL pool scraper), and **SQLite** on macOS Apple Silicon.
 
 ---
 
 ## Mục lục
-1. [Tổng quan chương trình](#1-tổng-quan-chương-trình)
-2. [Cơ chế điều phối theo lô & Discovery liên tục](#2-cơ-chế-điều-phối-theo-lô--discovery-liên-tục)
-3. [Tiêu chuẩn chất lượng dữ liệu & Bộ lọc NBA](#3-tiêu-chuẩn-chất-lượng-dữ-liệu--bộ-lọc-nba)
-4. [Định dạng dữ liệu 17 cột](#4-định-dạng-dữ-liệu-17-cột)
-5. [Cấu trúc thư mục & Artifacts](#5-cấu-trúc-thư-mục--artifacts)
-6. [Thiết lập môi trường & Đăng nhập](#6-thiết-lập-môi-trường--đăng-nhập)
-7. [Lệnh chạy thử nghiệm 60 phút (Pilot Benchmark)](#7-lệnh-chạy-thử-nghiệm-60-phút-pilot-benchmark)
-8. [Lệnh tham khảo cho phiên dài 8 giờ](#8-lệnh-tham-khảo-cho-phiên-dài-8-giờ)
-9. [Bảng tham số dòng lệnh (CLI Reference)](#9-bảng-tham-số-dòng-lệnh-cli-reference)
-10. [Kiểm thử offline (Unit & Integration Tests)](#10-kiểm-thử-offline-unit--integration-tests)
-11. [Xử lý sự cố & Phiên đăng nhập (Troubleshooting)](#11-xử-lý-sự-cố--phiên-đăng-nhập-troubleshooting)
+1. [Tổng quan kiến trúc đa nền tảng](#1-tổng-quan-kiến-trúc-đa-nền-tảng)
+2. [Lệnh chạy phiên 8 giờ cho từng nền tảng (8-Hour Run Commands)](#2-lệnh-chạy-phiên-8-giờ-cho-từng-nền-tảng-8-hour-run-commands)
+   - [2.1. Facebook Pipeline (8 Giờ)](#21-facebook-pipeline-8-giờ)
+   - [2.2. X / Twitter Pipeline (8 Giờ)](#22-x--twitter-pipeline-8-giờ)
+   - [2.3. Discovery Engine (Tạo mục tiêu thu thập)](#23-discovery-engine-tạo-mục-tiêu-thu-thập)
+3. [Định dạng dữ liệu chuẩn 17 cột & Ánh xạ Metric](#3-định-dạng-dữ-liệu-chuẩn-17-cột--ánh-xạ-metric)
+4. [Cơ chế cổng kiểm định chất lượng (Research Quality Gate)](#4-cơ-chế-cổng-kiểm-định-chất-lượng-research-quality-gate)
+5. [Toàn vẹn Metric & Cách ly dữ liệu (Metric & Demo Isolation)](#5-toàn-vẹn-metric--cách-ly-dữ-liệu-metric--demo-isolation)
+6. [Cấu trúc thư mục & Artifacts](#6-cấu-trúc-thư-mục--artifacts)
+7. [Thiết lập môi trường & Đăng nhập](#7-thiết-lập-môi-trường--đăng-nhập)
+8. [Bảng tham số dòng lệnh chi tiết (CLI Reference)](#8-bảng-tham-số-dòng-lệnh-chi-tiết-cli-reference)
+9. [Kiểm thử tự động (Test Suite 66/66 Passed)](#9-kiểm-thử-tự-động-test-suite-6666-passed)
 
 ---
 
-## 1. Tổng quan chương trình
+## 1. Tổng quan kiến trúc đa nền tảng
 
-Chương trình phục vụ nghiên cứu Social Listening mảng **Sport → Basketball → NBA**, thu thập dữ liệu bài viết từ danh sách Facebook Fanpage chính thức và uy tín về NBA.
+Hệ thống phục vụ nghiên cứu Social Listening thể thao (trọng tâm: **Basketball / NBA**, mở rộng: **Football, F1, Athletics**) với kiến trúc Adapter Pattern độc lập:
 
-### Đặc điểm kiến trúc:
-- **Luồng thu thập:** Khám phá URL (`Page discovery`) $\to$ lưu hàng đợi SQLite $\to$ mở từng URL bài viết để trích xuất chi tiết 17 cột.
-- **Trình duyệt đơn phiên (Single Persistent Context):** Sử dụng 1 browser session duy nhất với profile lưu trữ tại `profiles/facebook` (seed: 12345), không mở song song nhiều browser gây xung đột session hoặc checkpoint.
-- **Hai tab làm việc độc lập:**
-  - `Discovery Tab`: Mở trang Fanpage, cuộn và phát hiện bài viết mới. Tab này được giữ mở và giữ nguyên vị trí cuộn khi chuyển sang trích xuất.
-  - `Extraction Tab`: Mở từng URL bài viết để cào chi tiết caption, like, comment, share, timestamp và đóng/tái sử dụng tuần tự.
-- **Chống trùng lặp & Ràng buộc Scope:** Mọi task được gắn `dataset_scope` (mặc định: `facebook:basketball:nba`). Dữ liệu bóng đá, điền kinh hoặc các nghiên cứu khác lưu trước đó trong SQLite hoàn toàn tách biệt, không bị trộn lẫn vào dataset NBA.
-- **Xuất dữ liệu đồng bộ tuyệt đối:** Cả 3 định dạng `facebook_dataset.csv`, `facebook_dataset.json`, và `facebook_dataset.jsonl` được tạo ra từ **cùng một truy vấn** các bản ghi được chấp nhận (`is_accepted = 1`), ghi qua file tạm `.tmp` và thay thế nguyên tử (`atomic replace`), đảm bảo không có sự sai lệch giữa các file.
+```text
+               ┌────────────────────────────────────────────────────────┐
+               │           Unified Taxonomy & Keyword Engine            │
+               │   (Basketball/NBA, Football/EPL, F1, WorldAthletics)   │
+               └───────────────────────────┬────────────────────────────┘
+                                           │
+         ┌─────────────────────────────────┼─────────────────────────────────┐
+         │                                 │                                 │
+         ▼                                 ▼                                 ▼
+┌──────────────────┐             ┌──────────────────┐             ┌──────────────────┐
+│ Facebook Adapter │             │    X Adapter     │             │ Instagram / Th.  │
+│  (CloakBrowser)  │             │   (`twscrape`)   │             │   (Adapters)     │
+└────────┬─────────┘             └────────┬─────────┘             └────────┬─────────┘
+         │                                │                                │
+         └────────────────────────────────┼────────────────────────────────┘
+                                          │
+                                          ▼
+                       ┌──────────────────────────────────────┐
+                       │   SQLite Persistent Queue & State    │
+                       │ (`pipeline_tasks` / `pipeline.db`)   │
+                       └──────────────────┬───────────────────┘
+                                          │
+                                          ▼
+                       ┌──────────────────────────────────────┐
+                       │ Research Quality Gate & Scope Verif. │
+                       │    (is_accepted = 1 vs review)       │
+                       └──────────────────┬───────────────────┘
+                                          │
+                                          ▼
+                       ┌──────────────────────────────────────┐
+                       │       Standardized 17-Column         │
+                       │     (CSV, JSON, JSONL Exports)       │
+                       └──────────────────────────────────────┘
+```
 
----
-
-## 2. Cơ chế điều phối theo lô & Discovery liên tục
-
-Trước đây, quá trình discovery thường phải quét xong toàn bộ Fanpage rồi mới bắt đầu trích xuất, hoặc nếu ngắt giữa chừng thì lần sau phải tải lại từ đầu Fanpage.
-
-### Cải tiến vòng điều phối:
-1. **Khám phá và trích xuất xen kẽ theo lô (`--batch-size 20`):**
-   - Tab Discovery mở Fanpage nguồn **một lần duy nhất**.
-   - Mỗi lượt cuộn, các link bài viết mới được chuẩn hóa (loại bỏ tracking `fbclid`, `ref`...) và ghi ngay lập tức vào SQLite.
-   - Khi phát hiện đủ 20 bài mới (hoặc khi nguồn tạm dừng tiến triển), Discovery tạm nhường quyền điều khiển.
-   - Tab Discovery **vẫn giữ nguyên vị trí cuộn trên trang**, không bị đóng và không gọi `goto()` lại từ đầu trang.
-   - Tab Extraction tiến hành cào dữ liệu cho lô bài trong hàng đợi.
-   - Sau khi hoàn thành lô, Tab Discovery tiếp tục cuộn xuống để tìm các bài cũ hơn.
-2. **Kiểm soát hàng đợi tồn đọng (`--backlog-limit 150`):**
-   - Tránh việc discovery chạy quá xa so với tốc độ trích xuất. Nếu hàng đợi còn hơn 150 task chưa xử lý, discovery sẽ tạm dừng để extraction giải phóng hàng đợi.
-3. **Chuyển nguồn linh hoạt & Giới hạn vòng quét (`--source-max-scrolls 100`):**
-   - Thay thế mức giới hạn cứng 60 vòng quét cũ bằng ngân sách có thể cấu hình.
-   - Khi một nguồn không còn bài mới sau số vòng nghỉ (`--idle-rounds 10`), pipeline ghi nhận trạng thái và chuyển sang nguồn tiếp theo trong file `--pages`.
-   - Nguồn bị dừng do hết thời gian hoặc người dùng ngắt bằng `Ctrl+C` vẫn giữ nguyên điều kiện tiếp tục cho lần chạy sau.
-
----
-
-## 3. Tiêu chuẩn chất lượng dữ liệu & Bộ lọc NBA
-
-### 3.1. Chính sách bài viết Video / Reel:
-- **Không lấy caption video/reel:** Do đặc thù DOM player của Facebook chèn phụ đề tự động hoặc text rác, các bài viết có `media_type == "video"` được bỏ qua caption (`text = null`), không trích xuất hashtags/mentions/sport.
-- **Tiêu chí chấp nhận:** Bài video được ghi nhận trạng thái kỹ thuật `video_skipped`, **không được chấp nhận** vào dataset bài nghiên cứu NBA (`is_accepted = 0`), và không tính vào mục tiêu số bài NBA hợp lệ.
-
-### 3.2. Bộ lọc NBA dựa trên luật (Rule-Based Classifier):
-Phân loại chính xác dựa trên bằng chứng nội dung, không gọi API ngoài, không suy diễn từ điểm xác suất giả định:
-- **`sport_category`:** Gán `"Basketball"` nếu có bằng chứng bóng rổ.
-- **`competition`:** Xác định giải đấu cụ thể (`"NBA"`).
-- **Quy tắc bắt buộc đã kiểm chứng:**
-  - `NBA Finals: Lakers vs Celtics` $\to$ Nhận diện bằng chứng NBA trực tiếp (`matched`).
-  - Bài viết chỉ về `WNBA`, `EuroLeague`, `VBA`, `FIBA`, `NCAA` $\to$ Bị loại khỏi phạm vi NBA (`unmatched`), dù vẫn là bóng rổ.
-  - Từ `NBA` nằm trong `WNBA` $\to$ Không bị nhận nhầm thành NBA (sử dụng regex `(?<![Ww])\bNBA\b`).
-  - Câu *"I cooked curry for dinner"* $\to$ Không nhận bóng rổ/NBA vì từ `curry` đứng một mình; yêu cầu tên đầy đủ (*Stephen Curry*) hoặc ngữ cảnh bóng rổ đi kèm.
-  - Bài viết chỉ gồm emoji hoặc quá ngắn $\to$ Đánh dấu `uncertain`.
-  - Bài viết tuyển dụng, bán vé, quảng cáo khuyến mãi trên Fanpage NBA nhưng không có nội dung trận đấu $\to$ Đánh dấu `uncertain`.
-  - Game `NBA 2K` $\to$ Loại bỏ (`unmatched`, lý do: nội dung thể thao điện tử/video game).
-  - Giải phát triển `G League` $\to$ Mặc định loại khỏi phạm vi NBA chính (`unmatched`).
-
-### 3.3. Định nghĩa bài viết hợp lệ được chấp nhận (`is_accepted = 1`):
-Một bản ghi chỉ được đưa vào `facebook_dataset.csv`, `facebook_dataset.json`, và `facebook_dataset.jsonl` khi thỏa mãn đồng thời:
-1. Có `post_id` chuỗi hợp lệ, không trùng với bài đã ghi nhận.
-2. Là bài chữ/ảnh (`media_type != "video"`), có caption văn bản không rỗng.
-3. Phân loại NBA đạt `matched`.
-4. Có đầy đủ `post_url`, `published_at` (ISO 8601 có timezone offset), `collected_at`, `sport_category = "Basketball"`.
-5. Có `like_count` hợp lệ (số nguyên $\ge 0$) đo lường tương tác phục vụ nghiên cứu.
-6. Các trường không hiển thị như `view_count` được để `null` (ô trống trong CSV).
+### Các nền tảng cốt lõi:
+1. **Facebook (`facebook_pipeline.py`):**
+   - Thu thập qua **CloakBrowser stealth session** (profile lưu tại `profiles/facebook`).
+   - Điều phối 2 tab độc lập: Tab Discovery cuộn tìm URL và giữ nguyên vị trí trên Fanpage; Tab Extraction mở cào chi tiết caption, tương tác, timestamp.
+   - Cơ chế cào theo lô (`--batch-size 20`), tỷ lệ trích xuất tương tác đạt 100% yield (0% missing like_count).
+2. **X / Twitter (`x_pipeline.py`):**
+   - Tích hợp **`twscrape`** khai thác GraphQL endpoint với Account Pool xoay vòng.
+   - Hỗ trợ tìm kiếm theo từ khóa, hashtag và mention graph snowballing.
+   - Cổng kiểm soát chất lượng: Phát hiện và đưa các tweet dùng từ khóa mơ hồ (ví dụ: *"Warriors"* nói về phim ảnh hoặc hiệp sĩ thời trung cổ mà thiếu ngữ cảnh bóng rổ) vào diện rà soát (`needs_review`, `is_accepted = 0`).
+   - Tách biệt tuyệt đối giữa view tweet (`viewCount`), video view (`video_views`) và bài trích dẫn (quote tweets).
+   - Bảo vệ timeout (`asyncio.wait_for`) chống treo vô hạn khi hết quota tài khoản.
+3. **Khám phá tự động (Autonomous Discovery):**
+   - Bóc tách liên kết mention chuẩn nền tảng (ưu tiên `<a href>` thực tế trong DOM Facebook và entity `mentionedUsers` trên X).
+   - Giới hạn độ sâu phân nhánh (fan-out limit 3 profile/bài) chống trôi dạt chủ đề.
 
 ---
 
-## 4. Định dạng dữ liệu 17 cột
+## 2. Lệnh chạy phiên 8 giờ cho từng nền tảng (8-Hour Run Commands)
 
-File xuất tuân thủ chính xác 17 cột, thứ tự và định dạng:
+> [!IMPORTANT]
+> **Hướng dẫn vận hành phiên dài:**
+> - Luôn chạy kèm tiền tố `caffeinate -i` để ngăn hệ điều hành macOS tự chuyển sang chế độ ngủ (sleep) khi đang chạy.
+> - Cắm sạc MacBook và để mở nắp máy.
+> - Nếu mạng gián đoạn hoặc bạn chủ động dừng bằng `Ctrl+C`, mọi task đã hoàn thành đều được commit an toàn vào SQLite. Bạn có thể chạy lại cùng một lệnh bất kỳ lúc nào để **tiếp tục (resume)** mà không cào lại bài trùng.
+
+### 2.1. Facebook Pipeline (8 Giờ)
+
+Thu thập bài viết từ danh sách 58 Fanpage NBA chính thức và uy tín (`sources/nba_pages_active.txt`):
+
+```bash
+caffeinate -i python3 -u facebook_pipeline.py \
+  --pages sources/nba_pages_active.txt \
+  --sport-hint Basketball \
+  --filter-sport Basketball \
+  --competition NBA \
+  --batch-size 20 \
+  --max-hours 8 \
+  --max-refreshes 0 \
+  --output-dir output/facebook_run
+```
+
+#### Giải thích tham số Facebook:
+* `caffeinate -i`: Giữ macOS thức trong suốt phiên 8 tiếng.
+* `--pages sources/nba_pages_active.txt`: File danh sách Fanpage NBA đã được rà soát và loại bỏ các nguồn chết/đổi URL.
+* `--sport-hint Basketball` & `--competition NBA`: Kích hoạt bộ phân loại và đối chiếu bằng chứng NBA.
+* `--batch-size 20`: Discovery 20 bài mới rồi trích xuất ngay, giữ vị trí cuộn trên Fanpage.
+* `--max-hours 8`: Đặt trần ngân sách thời gian 8 giờ. Hết thời gian, pipeline dừng thu thập mới, dành thời gian lưu state và xuất file an toàn.
+* `--output-dir output/facebook_run`: Thư mục chứa cơ sở dữ liệu SQLite, file CSV, JSON, JSONL và báo cáo kiểm định.
+
+---
+
+### 2.2. X / Twitter Pipeline (8 Giờ)
+
+Thu thập tweet NBA thời gian thực qua GraphQL API với vòng lặp polling liên tục:
+
+```bash
+caffeinate -i python3 -u x_pipeline.py \
+  --sport Basketball \
+  --competition NBA \
+  --queries "#NBA,NBA lang:en,Warriors NBA,Lakers NBA,Celtics NBA" \
+  --limit-per-query 50 \
+  --max-hours 8 \
+  --poll-interval-sec 180 \
+  --search-timeout 45.0 \
+  --output-dir output/x_run
+```
+
+#### Quản lý Account Pool (X Burner Accounts):
+Nếu sử dụng tài khoản đăng nhập để tăng hạn ngạch truy vấn:
+```bash
+# Nạp danh sách tài khoản từ file (định dạng: username:password:email:email_password)
+python3 x_pipeline.py --accounts-file profiles/x_accounts.txt
+
+# Kiểm tra trạng thái pool tài khoản
+python3 x_pipeline.py --list-accounts
+```
+
+#### Chế độ Demo cách ly an toàn (Quick Verification):
+Dùng để kiểm tra nhanh mapping 17 cột và cấu trúc SQLite mà không tốn quota:
+```bash
+python3 x_pipeline.py --demo --limit-per-query 5
+# Toàn bộ dữ liệu demo được cách ly hoàn toàn tại: output/x_demo/
+```
+
+---
+
+### 2.3. Discovery Engine (Tạo mục tiêu thu thập)
+
+Sử dụng Discovery Engine CLI để tự động sinh danh sách URL tìm kiếm và hashtag cho từng môn thể thao:
+
+```bash
+# Hiển thị URL tìm kiếm NBA cho tất cả nền tảng
+python3 -m discovery_engine.cli targets --sport Basketball --competition NBA
+
+# Hiển thị URL tìm kiếm cho giải Ngoại hạng Anh (Football EPL)
+python3 -m discovery_engine.cli targets --sport Football --competition EPL
+
+# Xuất danh sách URL mục tiêu ra file
+python3 -m discovery_engine.cli targets --sport Basketball --competition NBA --output targets_nba.txt
+```
+
+---
+
+## 3. Định dạng dữ liệu chuẩn 17 cột & Ánh xạ Metric
+
+File xuất tuân thủ chính xác hợp đồng 17 cột theo thứ tự bắt buộc:
 
 ```text
 post_id, platform, text, published_at, collected_at, author_id,
@@ -98,157 +174,158 @@ language, hashtags, mentions, like_count, comment_count, share_count,
 view_count, media_type, author_followers, post_url, sport_category
 ```
 
-- **Mã hóa:** UTF-8-SIG (`utf-8-sig`) giúp hiển thị tốt trên Excel và các công cụ phân tích.
-- **Giá trị null:** Ô trống trong CSV, `null` trong JSON/JSONL.
-- **Định dạng list:** `hashtags` và `mentions` được serialize dạng JSON array string (ví dụ: `["@lakers"]` hoặc `[]`).
-- **ID:** Giữ nguyên chuỗi, không ép kiểu sang số để tránh làm tròn mất ký tự.
-- **Thời gian:** Chuẩn ISO 8601 kèm múi giờ (mặc định Asia/Ho_Chi_Minh: `+07:00`).
+### Bảng ánh xạ ý nghĩa Metric giữa các nền tảng:
+
+| Cột (Column) | Ý nghĩa trên Facebook | Ý nghĩa trên X (Twitter) | Quy ước kỹ thuật |
+|---|---|---|---|
+| `like_count` | Tổng số reactions (Like, Love, Haha, Wow, Sad, Angry) | Lượt Favorites / Likes (`likeCount`) | Số nguyên $\ge 0$ |
+| `comment_count` | Tổng số bình luận (`commentsCount`) | Lượt trả lời (`replyCount`) | Số nguyên $\ge 0$ |
+| `share_count` | Tổng số lượt chia sẻ (`sharesCount`) | Lượt Retweet / Repost (`retweetCount`) | Số nguyên $\ge 0$ (Không gồm Quote) |
+| `view_count` | `null` (ô trống) cho bài chữ/ảnh; video views nếu có | Tweet Impressions (`viewCount`) | `int \| null` (Không gán 0 giả định) |
+| `author_followers` | Số người theo dõi Trang (`Followers`) | Số người theo dõi tài khoản (`followersCount`) | `null` nếu là placeholder user |
+| `post_id` | Định danh bài viết Facebook | ID tweet trên X (dạng chuỗi) | Giữ nguyên chuỗi, không ép kiểu số |
+| `hashtags` | Mảng JSON: `["NBA", "Lakers"]` | Mảng JSON: `["NBA", "Lakers"]` | Chuỗi JSON hợp lệ |
+| `mentions` | Mảng JSON: `["@KingJames"]` | Mảng JSON: `["@KingJames"]` | Chuỗi JSON hợp lệ |
+| `sport_category` | `"Basketball"` | `"Basketball"` | Tên môn thể thao chuẩn hóa |
+
+> [!NOTE]
+> Toàn bộ thông tin chi tiết về Quote Tweets (`quoted_tweet`), Video Views (`video_views`), trạng thái tài khoản (`is_placeholder_user`), và phân loại bài (`source_type`) được lưu giữ đầy đủ trong trường `tech_meta_json` của SQLite để phục vụ nghiên cứu sâu.
 
 ---
 
-## 5. Cấu trúc thư mục & Artifacts
+## 4. Cơ chế cổng kiểm định chất lượng (Research Quality Gate)
 
-Sau khi chạy, thư mục đầu ra (ví dụ: `output/nba_60min/`) chứa các file:
+Không phải mọi bài viết lấy về đều được coi là bài hợp lệ (`is_accepted = 1`). Hệ thống áp dụng 4 tầng kiểm định:
+
+1. **Gate 1 - Tính toàn vẹn cấu trúc:** Bắt buộc có `post_id`, `post_url` hợp lệ, `published_at` đúng chuẩn ISO và không vượt quá thời gian thực tế.
+2. **Gate 2 - Caption văn bản:** Không chấp nhận bài rỗng caption. Trên Facebook, các bài video/reel có DOM phụ đề rác được đánh dấu `video_skipped` và không đưa vào dataset nghiên cứu.
+3. **Gate 3 - Phân loại Scope & Xử lý từ khóa mơ hồ:**
+   * Từ khóa đơn nghĩa rộng (*Warriors, Kings, Magic, Thunder, Spurs, Nets, Heat, Suns...*) nếu xuất hiện đơn lẻ trong bài viết đời sống (ví dụ: *"Ancient warriors in history"*, *"The summer heat is intense"*) mà **không có tín hiệu bóng rổ bổ trợ** sẽ bị gán `is_accepted = 0`, chuyển sang nhóm `status = 'needs_review'`.
+   * Ghi rõ lý do kiểm duyệt trong `review_reasons`.
+4. **Gate 4 - Bảo toàn dữ liệu thô:** Bản ghi chưa đạt chuẩn (`is_accepted = 0`) vẫn được lưu trữ nguyên vẹn trong SQLite `pipeline_tasks` kèm `tech_meta_json` phục vụ đối chiếu và hậu kiểm.
+
+---
+
+## 5. Toàn vẹn Metric & Cách ly dữ liệu (Metric & Demo Isolation)
+
+* **Bảo toàn `view_count: int | None`:** Bỏ nhận định "view_count chính xác 100%". Hệ thống lưu đúng số được trả về, giữ nguyên `null` khi thiếu, tuyệt đối không lấy video view đè vào tweet view.
+* **Tách riêng Quote Tweet:** Bài trích dẫn bài khác giữ nguyên metric của bài hiện tại, không gộp chỉ số của bài được trích dẫn.
+* **Xử lý Placeholder User:** Nhận diện đối tượng người dùng giữ chỗ trong `twscrape` (khi tài khoản bị khóa/xóa) và gán `author_followers = None` thay vì số 0 giả định.
+* **Cách ly dữ liệu Demo:**
+  * Lệnh `--demo` hoạt động trên database riêng `output/x_demo/demo_pipeline.db`.
+  * Bộ lọc Export nghiên cứu tự động loại bỏ bản ghi có cờ `is_demo=True`, đảm bảo không làm bẩn counter và khóa chống trùng của dữ liệu thật.
+
+---
+
+## 6. Cấu trúc thư mục & Artifacts
 
 ```text
-output/nba_60min/
-├── facebook_pipeline.sqlite       # Cơ sở dữ liệu SQLite quản lý toàn bộ task & state
-├── facebook_dataset.csv          # File CSV chuẩn 17 cột (chỉ chứa bài được chấp nhận)
-├── facebook_dataset.json         # Danh sách JSON bài viết được chấp nhận
-├── facebook_dataset.jsonl        # JSON Lines bài viết được chấp nhận
-├── run_summary.json              # Báo cáo thống kê chi tiết riêng cho phiên chạy hiện tại
-├── quality_report.json           # Tỷ lệ phủ 17 cột, phân bố NBA, thống kê từng nguồn, mẫu đối chiếu
-├── progress.json                 # Cập nhật tiến độ thời gian thực (real-time progress)
-├── pipeline.log                  # Log chi tiết quá trình vận hành
-├── pipeline.lock                 # File khóa ngăn xung đột tiến trình chạy trùng
-└── facebook_posts_auto_debug_*.json # Bản ghi kỹ thuật kiểm toán chi tiết (tự động giữ lại 1 file mới nhất, dọn file cũ)
+playwright-demo/
+├── facebook_pipeline.py            # Runner chính của Facebook Pipeline
+├── x_pipeline.py                   # Runner chính của X (Twitter) Pipeline
+├── facebook_dataset.py             # Schema 17 cột & Logic trích xuất DOM Playwright
+├── discovery_engine/               # Động cơ khám phá đa nền tảng
+│   ├── engine.py                   # Bộ điều phối DiscoveryEngine
+│   ├── taxonomy.py                 # Phân loại thể thao, từ khóa, hashtags
+│   ├── models.py                   # Data models (DiscoveredPost, TargetSpec)
+│   └── adapters/                   # Adapters chuyên biệt
+│       ├── facebook_adapter.py     # Facebook Discovery & DOM Mention Handler
+│       ├── x_adapter.py            # X Discovery & Mapping 17 cột
+│       ├── instagram_adapter.py    # Instagram Discovery
+│       └── threads_adapter.py      # Threads Discovery
+├── sources/
+│   ├── nba_pages_active.txt        # 58 Fanpage NBA hoạt động tốt đã qua kiểm toán
+│   └── nba_pages.txt               # Danh sách gốc
+├── profiles/
+│   ├── facebook/                   # Persistent browser profile của Facebook
+│   └── x_accounts.db               # SQLite account pool của twscrape
+├── tests/                          # Bộ kiểm thử 66 test cases
+├── output/
+│   ├── facebook_run/               # Dataset & artifacts của Facebook
+│   ├── x_run/                      # Dataset & artifacts của X
+│   └── x_demo/                     # Workspace cách ly của Demo
+└── README.md                       # Tài liệu hướng dẫn sử dụng
 ```
+
+### Các file đầu ra chuẩn trong mỗi thư mục output:
+* `*_dataset.csv`: Dataset chuẩn 17 cột (UTF-8-SIG), chỉ chứa bài được chấp nhận (`is_accepted = 1`).
+* `*_dataset.json`: Dữ liệu dạng JSON array.
+* `*_dataset.jsonl`: Dữ liệu dạng JSON Lines (tiện nạp vào pandas / BigQuery).
+* `quality_report.json`: Báo cáo đối soát chất lượng, tỷ lệ phủ 17 cột, danh sách bài `needs_review` và lý do.
+* `run_summary.json`: Thống kê tổng quan phiên chạy.
 
 ---
 
-## 6. Thiết lập môi trường & Đăng nhập
+## 7. Thiết lập môi trường & Đăng nhập
 
-### 6.1. Kích hoạt môi trường ảo:
+### 7.1. Kích hoạt môi trường ảo:
 ```bash
 source .venv/bin/activate
 ```
 
-### 6.2. Đăng nhập Facebook (Chỉ thực hiện một lần khi phiên hết hạn):
-Khi gặp thông báo yêu cầu xác minh hoặc checkpoint, chạy script đăng nhập tương tác có giao diện:
+### 7.2. Cài đặt phụ thuộc:
+```bash
+pip install playwright twscrape pytest
+playwright install chromium
+```
+
+### 7.3. Đăng nhập Facebook (Khi phiên hết hạn):
+Khi gặp cảnh báo checkpoint hoặc màn hình đăng nhập:
 ```bash
 python3 cloak_facebook_login.py
 ```
-Đăng nhập tài khoản trên cửa sổ trình duyệt hiện ra, hoàn tất xác thực 2 bước (2FA nếu có). Sau khi vào trang chủ Facebook thành công, quay lại Terminal nhấn `Enter` để lưu profile tại `profiles/facebook`.
+Hoàn tất đăng nhập trên cửa sổ trình duyệt hiện ra, sau đó quay lại Terminal nhấn `Enter` để lưu cookie và session.
 
 ---
 
-## 7. Lệnh chạy thử nghiệm 60 phút (Pilot Benchmark)
+## 8. Bảng tham số dòng lệnh chi tiết (CLI Reference)
 
-> [!IMPORTANT]
-> **Ràng buộc:** Lệnh này do bạn **chủ động chạy** từ Terminal trên máy của bạn. Agent không tự kích hoạt lệnh này.
-
-Mở Terminal tại thư mục project, giữ máy không ngủ và chạy:
-
-```bash
-caffeinate -i python3 -u facebook_pipeline.py \
-  --pages sources/nba_pages.txt \
-  --sport-hint Basketball \
-  --filter-sport Basketball \
-  --competition NBA \
-  --batch-size 20 \
-  --max-hours 1 \
-  --max-refreshes 0 \
-  --output-dir output/nba_60min
-```
-
-### Giải thích các tham số chính:
-- `caffeinate -i`: Giữ hệ điều hành macOS không rơi vào chế độ sleep trong lúc tác vụ đang chạy (yêu cầu để mở nắp MacBook và cắm sạc).
-- `--pages sources/nba_pages.txt`: Danh sách Fanpage nguồn (mặc định khởi tạo gồm `https://www.facebook.com/nba/`).
-- `--sport-hint Basketball`: Gợi ý ngữ cảnh thể thao phục vụ phân loại.
-- `--filter-sport Basketball`: Lọc bài viết môn bóng rổ khi xuất dữ liệu.
-- `--competition NBA`: Kích hoạt bộ lọc bằng chứng giải đấu NBA.
-- `--batch-size 20`: Discovery tối đa 20 URL mới rồi nhường quyền cho Extraction trích xuất dữ liệu, sau đó Discovery tiếp tục từ vị trí đã cuộn.
-- `--max-hours 1`: Ngân sách thời gian tối đa 60 phút. Hết giờ, pipeline dừng thu thập mới, dành tối đa 20 giây lưu trạng thái và xuất file hoàn chỉnh.
-- `--max-refreshes 0`: Tắt reload trang khi cạn bài (tránh quay lại đầu trang).
-- `--output-dir output/nba_60min`: Toàn bộ database, dataset, log và báo cáo lưu độc lập tại đây.
-
----
-
-## 8. Lệnh tham khảo cho phiên dài 8 giờ
-
-> [!NOTE]
-> Lệnh này chỉ dùng để tham khảo sau khi đã đánh giá kết quả từ phiên thử 60 phút:
-
-```bash
-caffeinate -i python3 -u facebook_pipeline.py \
-  --pages sources/nba_pages.txt \
-  --sport-hint Basketball \
-  --filter-sport Basketball \
-  --competition NBA \
-  --batch-size 20 \
-  --max-hours 8 \
-  --max-refreshes 0 \
-  --output-dir output/nba_60min
-```
-
-Chạy cùng `--output-dir output/nba_60min` sẽ tự động tận dụng danh sách đã cào, hàng đợi và cache của phiên 60 phút trước đó mà không cào lại bài trùng.
-
----
-
-## 9. Bảng tham số dòng lệnh (CLI Reference)
+### 8.1. `facebook_pipeline.py`
 
 | Tham số | Kiểu | Mặc định | Ý nghĩa |
 |---|---|---|---|
-| `--pages <file>` | File path | `None` | File chứa danh sách Fanpage Facebook (1 URL/dòng, hỗ trợ `#`). |
-| `--page <url>` | URL | `None` | Thu thập từ 1 Fanpage cụ thể. |
-| `--urls <file>` | File path | `None` | Thu thập từ danh sách URL bài viết có sẵn (.txt, .csv, .jsonl). |
-| `--competition` | String | `NBA` | Phạm vi giải đấu mục tiêu cần khớp bằng chứng. |
-| `--sport-hint` | String | `Basketball` | Gợi ý môn thể thao từ nguồn. |
-| `--filter-sport` | String | `Basketball` | Bộ lọc môn thể thao áp dụng khi xuất dataset. |
+| `--pages <file>` | Path | `None` | File danh sách URL Fanpage nguồn (mỗi dòng 1 URL). |
+| `--competition` | String | `NBA` | Giải đấu mục tiêu cần đối chiếu bằng chứng. |
+| `--sport-hint` | String | `Basketball` | Môn thể thao gợi ý. |
 | `--batch-size` | Integer | `20` | Số bài mới phát hiện trước khi chuyển sang trích xuất. |
-| `--max-hours` | Float | `1.0` | Giới hạn thời gian chạy của phiên (tính bằng giờ). |
+| `--max-hours` | Float | `1.0` | Giới hạn thời gian chạy (8 cho phiên 8 tiếng). |
 | `--source-max-scrolls` | Integer | `100` | Số vòng cuộn tối đa cho mỗi nguồn. |
-| `--idle-rounds` | Integer | `10` | Số vòng cuộn không thấy bài mới trước khi chuyển nguồn. |
-| `--max-refreshes` | Integer | `0` | Số lần reload trang khi cuộn đứng; 0 là tắt reload. |
-| `--backlog-limit` | Integer | `150` | Giới hạn hàng đợi chờ; vượt ngưỡng này discovery tạm dừng. |
-| `--target-valid` | Integer | `None` | Mục tiêu số bài NBA hợp lệ để dừng sớm (nếu muốn). |
-| `--max-attempts` | Integer | `None` | Trần số URL thử xử lý trong phiên. |
-| `--retry-failed` | Flag | `False` | Thử lại các bài từng bị lỗi mạng tạm thời (tối đa 3 lần). |
-| `--no-followers` | Flag | `False` | Bỏ qua bước lấy số follower nếu muốn tối ưu tốc độ. |
-| `--headless` | Flag | `False` | Chạy trình duyệt ở chế độ ẩn. |
-| `--output-dir` | Directory | `output` | Thư mục lưu trữ database, bản xuất và báo cáo. |
+| `--idle-rounds` | Integer | `10` | Số vòng cuộn không thấy bài mới trước khi đổi nguồn. |
+| `--max-refreshes` | Integer | `0` | Số lần reload trang khi đứng bài (0: tắt reload). |
+| `--target-valid` | Integer | `None` | Số bài hợp lệ mục tiêu để dừng phiên sớm. |
+| `--headless` | Flag | `False` | Chạy trình duyệt không giao diện. |
+| `--output-dir` | Path | `output` | Thư mục lưu trữ kết quả. |
+
+### 8.2. `x_pipeline.py`
+
+| Tham số | Kiểu | Mặc định | Ý nghĩa |
+|---|---|---|---|
+| `--sport` | String | `Basketball` | Môn thể thao mục tiêu. |
+| `--competition` | String | `NBA` | Giải đấu mục tiêu. |
+| `--queries` | String | `None` | Danh sách truy vấn tìm kiếm cách nhau bởi dấu phẩy. |
+| `--limit-per-query` | Integer | `20` | Số lượng tweet tối đa cho mỗi câu truy vấn. |
+| `--max-total-posts` | Integer | `None` | Trần số lượng bài viết toàn phiên thu thập. |
+| `--max-hours` | Float | `None` | Thời gian chạy tối đa (ví dụ: `8` cho phiên 8 giờ). |
+| `--poll-interval-sec` | Integer | `120` | Khoảng nghỉ (giây) giữa các vòng quét trong phiên dài. |
+| `--search-timeout` | Float | `45.0` | Timeout (giây) mỗi truy vấn để tránh treo khi nghẽn quota. |
+| `--accounts-file` | Path | `None` | File nạp danh sách tài khoản X burner. |
+| `--list-accounts` | Flag | `False` | In danh sách và trạng thái account pool. |
+| `--demo` | Flag | `False` | Chạy chế độ demo mẫu cách ly tại `output/x_demo/`. |
+| `--output-dir` | Path | `output/x_run` | Thư mục lưu kết quả. |
 
 ---
 
-## 10. Kiểm thử offline (Unit & Integration Tests)
+## 9. Kiểm thử tự động (Test Suite 66/66 Passed)
 
-Toàn bộ hệ thống được kiểm thử offline bằng **pytest**, sử dụng mock, fake page và HTML fixture cục bộ; không thực hiện cuộc gọi mạng hay mở trình duyệt thật ra internet.
+Toàn bộ hệ thống được bảo vệ bởi **66 ca kiểm thử tự động (Unit & Integration Tests)**, chạy hoàn toàn offline không gọi mạng:
 
-Chạy kiểm thử:
 ```bash
-python3 -m pytest tests/ -v
+PYTHONPATH=. .venv/bin/pytest -v
 ```
 
-### Kết quả kiểm thử đạt 30/30 tests:
-- `tests/test_local_units.py`: 16 tests về chuẩn hóa số liệu đa ngôn ngữ, timezone ISO 8601, tách biệt caption khỏi comment/sidebar, trích xuất mention và ID.
-- `tests/test_nba_pipeline.py`: 14 tests bao quát 12 tiêu chí nghiệm thu:
-  1. Trích xuất caption chữ/ảnh không lỗi biến `UnboundLocalError`.
-  2. Bỏ qua caption bài video và loại khỏi dataset nghiên cứu.
-  3. Phân lập vùng DOM bài viết, không lẫn gợi ý và bình luận.
-  4. Bộ lọc NBA: phân biệt Lakers/Celtics, loại WNBA/VBA/EuroLeague, loại curry ăn tối, nhận Stephen Curry, loại game 2K/G-League.
-  5. Chuẩn hóa URL, loại bỏ tracking tham số `fbclid`, chống trùng permalink.
-  6. Ghi nhận URL discovery tức thì vào SQLite.
-  7. Discovery session phân lô mà không reload trang từ đầu.
-  8. Phục hồi task `processing` sau crash thành `pending`.
-  9. Kiểm soát thời gian bằng monotonic deadline.
-  10. Phát hiện checkpoint / màn hình đăng nhập để dừng phiên an toàn.
-  11. Phân vùng scope SQLite, bảo vệ dữ liệu cũ không bị lẫn vào NBA dataset.
-  12. Tính nhất quán tuyệt đối giữa CSV, JSON và JSONL; cache follower theo TTL.
-
----
-
-## 11. Xử lý sự cố & Phiên đăng nhập (Troubleshooting)
-
-- **Khi gặp checkpoint hoặc bắt đăng nhập:** Pipeline tự động lưu tiến độ vào SQLite và thoát với mã cảnh báo rõ ràng. Hãy chạy `python3 cloak_facebook_login.py` để đăng nhập lại trên trình duyệt, sau đó tiếp tục chạy lệnh pipeline với cùng `--output-dir`.
-- **Tạm dừng bằng `Ctrl+C`:** Toàn bộ task đã hoàn thành được commit ngay lập tức vào database, file CSV/JSON/JSONL được cập nhật đến thời điểm dừng.
-- **Tiến trình chạy trùng lặp:** Hệ thống sử dụng file `pipeline.lock`. Nếu có tiến trình khác đang chạy cùng profile/output, chương trình sẽ từ chối chạy để bảo vệ dữ liệu.
+### Phân bố kiểm thử:
+* `tests/test_x_pipeline.py` (9 tests): Kiểm thử ánh xạ X sang 17 cột, cách ly metric view/quote, user placeholder, bộ lọc scope gate (Warriors không ngữ cảnh), cách ly dữ liệu demo, và gộp nguồn truy vấn (multi-query deduplication).
+* `tests/test_audit_improvements.py` (17 tests): Kiểm thử retry tương tác, xử lý video DOM, trích xuất số liệu đa ngôn ngữ, và đồng bộ CSV/JSON/JSONL.
+* `tests/test_discovery_engine.py` (9 tests): Kiểm thử Taxonomy 4 môn thể thao, keyword classifier, bộ điều phối engine và các adapters.
+* `tests/test_local_units.py` (16 tests): Kiểm thử các hàm đơn vị trích xuất ID, chuẩn hóa thời gian ISO, tách biệt caption và comment.
+* `tests/test_nba_pipeline.py` (15 tests): Kiểm thử bộ lọc NBA, vòng điều phối 2 tab, monotonic deadline, và khôi phục task sau crash.

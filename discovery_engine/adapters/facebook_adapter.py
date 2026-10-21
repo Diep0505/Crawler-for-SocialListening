@@ -9,7 +9,7 @@ Discovers posts across:
 
 import re
 from urllib.parse import quote_plus
-from typing import List, Optional
+from typing import List, Optional, Any
 from .base import BaseDiscoveryAdapter
 from ..models import DiscoveredPost
 import facebook_dataset as fd
@@ -150,3 +150,79 @@ class FacebookDiscoveryAdapter(BaseDiscoveryAdapter):
                 )
             )
         return items
+
+    def extract_mention_profiles(
+        self,
+        records_or_mentions: List[Any],
+        max_per_post: int = 3,
+        max_total_sources: int = 50,
+    ) -> List[str]:
+        """Extracts unique verified Facebook profile/Page URLs for snowball discovery.
+        
+        Prioritizes actual DOM hrefs and verified structured profile links rather than
+        blindly concatenating arbitrary '@...' text tokens into unverified Facebook URLs.
+        Applies depth/fan-out limits and deduplication.
+        """
+        extracted = []
+        seen = set()
+        reserved_paths = {
+            "events", "groups", "marketplace", "watch", "help", "gaming", "stories",
+            "reels", "settings", "privacy", "friends", "share", "photo.php", "permalink.php",
+            "here", "everyone", "highlight", "followers", "channel"
+        }
+
+        for item in records_or_mentions:
+            candidate_urls = []
+            
+            if isinstance(item, dict):
+                # 1. Prioritize explicit verified DOM mention hrefs if available
+                dom_hrefs = item.get("dom_mention_urls") or item.get("mention_urls") or []
+                for href in dom_hrefs:
+                    if href and "facebook.com" in href:
+                        candidate_urls.append(href)
+
+                # 2. Structured dom_mentions from page link extraction (e.g., @12345678 or @celtics)
+                dom_mentions = item.get("dom_mentions") or []
+                for dm in dom_mentions:
+                    clean = str(dm).strip().lstrip("@").rstrip(".,;:!?")
+                    if clean and clean.lower() not in reserved_paths:
+                        if clean.isdigit():
+                            candidate_urls.append(f"https://www.facebook.com/profile.php?id={clean}")
+                        elif not re.search(r"[\s\<\>\'\"\&]", clean):
+                            candidate_urls.append(f"https://www.facebook.com/{clean}/")
+
+                # If no DOM links exist, inspect raw mentions with strict slug validation
+                if not candidate_urls and "mentions" in item:
+                    raw_mentions = item.get("mentions") or []
+                    for m in raw_mentions:
+                        clean = str(m).strip().lstrip("@").rstrip(".,;:!?")
+                        # Only accept clean single-word slugs that look like valid Facebook page usernames
+                        if clean and len(clean) >= 3 and not re.search(r"[\s\<\>\'\"\&]", clean) and clean.lower() not in reserved_paths:
+                            candidate_urls.append(f"https://www.facebook.com/{clean}/")
+
+            elif isinstance(item, str):
+                # If a direct Facebook URL was passed
+                if "facebook.com" in item:
+                    candidate_urls.append(item)
+                else:
+                    clean = item.strip().lstrip("@").rstrip(".,;:!?")
+                    if clean and len(clean) >= 3 and not re.search(r"[\s\<\>\'\"\&]", clean) and clean.lower() not in reserved_paths:
+                        candidate_urls.append(f"https://www.facebook.com/{clean}/")
+
+            # Per-post limit (fan-out protection)
+            post_count = 0
+            for u in candidate_urls:
+                if post_count >= max_per_post:
+                    break
+                norm = (self.normalize_post_url(u) or u).rstrip("/") + "/"
+                slug = norm.lower()
+                if slug in seen:
+                    continue
+                seen.add(slug)
+                extracted.append(norm)
+                post_count += 1
+                if len(extracted) >= max_total_sources:
+                    return extracted
+
+        return extracted
+
