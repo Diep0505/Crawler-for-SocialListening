@@ -31,6 +31,7 @@ Usage Examples:
 
 import argparse
 import csv
+import hashlib
 import json
 import logging
 import os
@@ -161,6 +162,41 @@ class PipelineDB:
                     expires_at TEXT
                 )
             """)
+
+            self.conn.execute(r"""
+                CREATE TABLE IF NOT EXISTS collections (
+                    collection_id TEXT PRIMARY KEY,
+                    name TEXT,
+                    queries_json TEXT,
+                    exclude_keywords_json TEXT,
+                    keyword_match TEXT DEFAULT 'any',
+                    strip_accents INTEGER DEFAULT 0,
+                    limit_accepted INTEGER,
+                    created_at TEXT,
+                    updated_at TEXT
+                )
+            """)
+
+            self.conn.execute(r"""
+                CREATE TABLE IF NOT EXISTS collection_items (
+                    collection_id TEXT,
+                    canonical_url TEXT,
+                    post_id TEXT,
+                    is_accepted INTEGER DEFAULT 0,
+                    matched_keywords_json TEXT,
+                    rejection_reasons_json TEXT,
+                    discovery_queries_json TEXT,
+                    discovery_method TEXT DEFAULT 'keyword_search',
+                    search_url TEXT,
+                    first_discovered_at TEXT,
+                    last_discovered_at TEXT,
+                    run_id TEXT,
+                    PRIMARY KEY (collection_id, canonical_url)
+                )
+            """)
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_col_items_col ON collection_items(collection_id)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_col_items_accepted ON collection_items(collection_id, is_accepted)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_col_items_post_id ON collection_items(post_id)")
 
             # Non-destructive migrations: verify and add missing columns
             cols = [c[1] for c in self.conn.execute("PRAGMA table_info(pipeline_tasks)").fetchall()]
@@ -561,6 +597,378 @@ class PipelineDB:
         accepted_cnt = self.conn.execute(f"SELECT COUNT(DISTINCT post_id) FROM pipeline_tasks {where_clause} {'AND' if where_clause else 'WHERE'} is_accepted = 1", params).fetchone()[0]
         return total, stats, accepted_cnt
 
+    def register_collection(
+        self,
+        collection_id,
+        queries,
+        exclude_keywords=None,
+        keyword_match="any",
+        strip_accents=False,
+        limit_accepted=None,
+    ):
+        now = datetime.now(timezone.utc).isoformat()
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO collections (collection_id, name, queries_json, exclude_keywords_json, keyword_match, strip_accents, limit_accepted, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(collection_id) DO UPDATE SET
+                       queries_json = excluded.queries_json,
+                       exclude_keywords_json = excluded.exclude_keywords_json,
+                       keyword_match = excluded.keyword_match,
+                       strip_accents = excluded.strip_accents,
+                       limit_accepted = excluded.limit_accepted,
+                       updated_at = excluded.updated_at""",
+                (
+                    collection_id,
+                    collection_id,
+                    json.dumps(queries, ensure_ascii=False),
+                    json.dumps(exclude_keywords or [], ensure_ascii=False),
+                    keyword_match,
+                    1 if strip_accents else 0,
+                    limit_accepted,
+                    now,
+                    now,
+                ),
+            )
+
+    def enqueue_keyword_candidate(self, candidate, collection_id, collection_config, run_id=None):
+        """Enqueues candidate into collection_items and pipeline_tasks.
+        Deduplicates against collection_items, preserves multiple discovery queries.
+        If post already completed in pipeline_tasks, evaluates keyword criteria immediately without re-scraping.
+        Returns: (is_new, reused, cached_post_or_None)
+        """
+        post_url = candidate["post_url"]
+        canonical_url = candidate.get("canonical_url") or post_url
+        post_id = candidate.get("post_id") or fd.extract_post_id(canonical_url)
+        author_id = candidate.get("author_id")
+        discovery_query = candidate.get("discovery_query", "")
+        search_url = candidate.get("search_url", "")
+        source_type = candidate.get("source_type", "unknown")
+        now = datetime.now(timezone.utc).isoformat()
+
+        with self.conn:
+            # 1. Check existing in collection_items
+            row = self.conn.execute(
+                "SELECT discovery_queries_json, is_accepted FROM collection_items WHERE collection_id = ? AND canonical_url = ?",
+                (collection_id, canonical_url),
+            ).fetchone()
+
+            if row:
+                # Post already registered for this collection; append discovery_query if new
+                queries = []
+                try:
+                    queries = json.loads(row["discovery_queries_json"] or "[]")
+                except Exception:
+                    pass
+                if discovery_query and discovery_query not in queries:
+                    queries.append(discovery_query)
+                    self.conn.execute(
+                        "UPDATE collection_items SET discovery_queries_json = ?, last_discovered_at = ? WHERE collection_id = ? AND canonical_url = ?",
+                        (json.dumps(queries, ensure_ascii=False), now, collection_id, canonical_url),
+                    )
+                return False, False, None
+
+            # New candidate for this collection!
+            init_queries = [discovery_query] if discovery_query else []
+            self.conn.execute(
+                """INSERT INTO collection_items 
+                   (collection_id, canonical_url, post_id, is_accepted, matched_keywords_json, rejection_reasons_json,
+                    discovery_queries_json, discovery_method, search_url, first_discovered_at, last_discovered_at, run_id)
+                   VALUES (?, ?, ?, 0, '[]', '[]', ?, 'keyword_search', ?, ?, ?, ?)""",
+                (
+                    collection_id,
+                    canonical_url,
+                    post_id,
+                    json.dumps(init_queries, ensure_ascii=False),
+                    search_url,
+                    now,
+                    now,
+                    run_id,
+                ),
+            )
+
+            # 2. Check if already extracted in pipeline_tasks
+            task_row = self.conn.execute(
+                "SELECT record_json, tech_meta_json, status, author_id FROM pipeline_tasks WHERE (canonical_url = ? OR (post_id IS NOT NULL AND post_id = ?)) AND record_json IS NOT NULL LIMIT 1",
+                (canonical_url, post_id),
+            ).fetchone()
+
+            if task_row:
+                try:
+                    rec = json.loads(task_row["record_json"])
+                    meta = json.loads(task_row["tech_meta_json"] or "{}")
+                except Exception:
+                    rec = None
+                    meta = {}
+
+                if rec:
+                    is_matched, matched_kws, match_rejections = fd.match_keywords(
+                        rec.get("text"),
+                        include_keywords=collection_config["queries"],
+                        exclude_keywords=collection_config.get("exclude_keywords"),
+                        match_mode=collection_config.get("keyword_match", "any"),
+                        strip_accents=collection_config.get("strip_accents", False),
+                    )
+                    is_acc, qual_rejections = fd.evaluate_record_acceptance(
+                        rec,
+                        tech_meta=meta,
+                        target_sport=None,
+                        target_competition=None,
+                        allow_video=True,
+                        require_like_count=False,
+                    )
+                    is_col_accepted = is_matched and is_acc
+                    all_reasons = match_rejections + qual_rejections
+
+                    self.conn.execute(
+                        """UPDATE collection_items 
+                           SET is_accepted = ?, matched_keywords_json = ?, rejection_reasons_json = ?
+                           WHERE collection_id = ? AND canonical_url = ?""",
+                        (
+                            1 if is_col_accepted else 0,
+                            json.dumps(matched_kws, ensure_ascii=False),
+                            json.dumps(all_reasons, ensure_ascii=False),
+                            collection_id,
+                            canonical_url,
+                        ),
+                    )
+                    return True, True, rec
+
+            # 3. Not in pipeline_tasks yet: enqueue as pending
+            dataset_scope = f"facebook:collection:{collection_id}"
+            self.conn.execute(
+                """INSERT OR IGNORE INTO pipeline_tasks 
+                   (input_url, canonical_url, post_id, author_id, platform, source_type, dataset_scope, status, attempts, created_at, updated_at) 
+                   VALUES (?, ?, ?, ?, 'Facebook', ?, ?, 'pending', 0, ?, ?)""",
+                (canonical_url, canonical_url, post_id, author_id, source_type, dataset_scope, now, now),
+            )
+            return True, False, None
+
+    def record_keyword_success(
+        self,
+        input_url,
+        canonical_url,
+        post_id,
+        author_id,
+        record_17_col,
+        tech_meta,
+        collection_id,
+        collection_config,
+        run_id=None,
+    ):
+        """Records extracted post to pipeline_tasks and evaluates keyword match & quality criteria for the collection."""
+        now = datetime.now(timezone.utc).isoformat()
+        dataset_scope = f"facebook:collection:{collection_id}"
+
+        # 1. Evaluate keyword match
+        is_matched, matched_kws, match_rejections = fd.match_keywords(
+            record_17_col.get("text"),
+            include_keywords=collection_config["queries"],
+            exclude_keywords=collection_config.get("exclude_keywords"),
+            match_mode=collection_config.get("keyword_match", "any"),
+            strip_accents=collection_config.get("strip_accents", False),
+        )
+
+        # 2. Evaluate structural quality acceptance (generic: no sport requirement, video with caption allowed, missing metrics allowed as null)
+        is_acc, qual_rejections = fd.evaluate_record_acceptance(
+            record_17_col,
+            tech_meta=tech_meta,
+            target_sport=None,
+            target_competition=None,
+            allow_video=True,
+            require_like_count=False,
+        )
+
+        is_col_accepted = is_matched and is_acc
+        all_reasons = match_rejections + qual_rejections
+
+        if tech_meta is None:
+            tech_meta = {}
+        tech_meta["collection_id"] = collection_id
+        tech_meta["collection_is_accepted"] = is_col_accepted
+        tech_meta["matched_keywords"] = matched_kws
+        tech_meta["rejection_reasons"] = all_reasons
+
+        record_json = json.dumps(record_17_col, ensure_ascii=False)
+        tech_meta_json = json.dumps(tech_meta, ensure_ascii=False)
+        reasons_json = json.dumps(all_reasons, ensure_ascii=False)
+
+        with self.conn:
+            # Upsert into pipeline_tasks
+            self.conn.execute(
+                """INSERT OR IGNORE INTO pipeline_tasks 
+                   (input_url, canonical_url, post_id, author_id, platform, dataset_scope, run_id, status, attempts, created_at, updated_at) 
+                   VALUES (?, ?, ?, ?, 'Facebook', ?, ?, 'processing', 1, ?, ?)""",
+                (input_url, canonical_url, post_id, author_id, dataset_scope, run_id, now, now),
+            )
+            self.conn.execute(
+                """UPDATE pipeline_tasks 
+                   SET status = 'success', canonical_url = ?, post_id = ?, author_id = ?, 
+                       dataset_scope = COALESCE(dataset_scope, ?), run_id = COALESCE(?, run_id),
+                       is_accepted = ?, last_error = NULL, review_reasons = ?, 
+                       record_json = ?, tech_meta_json = ?, updated_at = ?
+                   WHERE input_url = ?""",
+                (
+                    canonical_url,
+                    post_id,
+                    author_id,
+                    dataset_scope,
+                    run_id,
+                    1 if is_col_accepted else 0,
+                    reasons_json,
+                    record_json,
+                    tech_meta_json,
+                    now,
+                    input_url,
+                ),
+            )
+
+            # Update collection_items
+            self.conn.execute(
+                """UPDATE collection_items 
+                   SET is_accepted = ?, matched_keywords_json = ?, rejection_reasons_json = ?, run_id = COALESCE(?, run_id)
+                   WHERE collection_id = ? AND canonical_url = ?""",
+                (
+                    1 if is_col_accepted else 0,
+                    json.dumps(matched_kws, ensure_ascii=False),
+                    reasons_json,
+                    run_id,
+                    collection_id,
+                    canonical_url,
+                ),
+            )
+
+        return is_col_accepted, matched_kws, all_reasons
+
+    def get_collection_item(self, collection_id, canonical_url):
+        """Returns a single collection_item record dictionary or None."""
+        row = self.conn.execute(
+            "SELECT * FROM collection_items WHERE collection_id = ? AND canonical_url = ?",
+            (collection_id, canonical_url),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def is_collection_item_accepted(self, collection_id, canonical_url):
+        row = self.conn.execute(
+            "SELECT is_accepted FROM collection_items WHERE collection_id = ? AND canonical_url = ?",
+            (collection_id, canonical_url),
+        ).fetchone()
+        return bool(row and row["is_accepted"] == 1)
+
+    def get_collection_accepted_records(self, collection_id):
+        """Retrieves distinct accepted records for a collection, deduplicated by post_id."""
+        query = """
+            SELECT ci.post_id, ci.canonical_url, ci.matched_keywords_json, ci.discovery_queries_json,
+                   ci.search_url, ci.discovery_method, pt.record_json, pt.tech_meta_json
+            FROM collection_items ci
+            JOIN pipeline_tasks pt ON ci.canonical_url = pt.canonical_url
+            WHERE ci.collection_id = ? AND ci.is_accepted = 1 AND pt.record_json IS NOT NULL
+            ORDER BY ci.rowid ASC
+        """
+        rows = self.conn.execute(query, (collection_id,)).fetchall()
+        seen_pids = set()
+        records = []
+        for r in rows:
+            pid = r["post_id"]
+            if pid and pid in seen_pids:
+                continue
+            try:
+                rec = json.loads(r["record_json"])
+            except Exception:
+                continue
+            if not all(k in rec for k in fd.REQUIRED_COLUMNS):
+                continue
+            if pid:
+                seen_pids.add(pid)
+            records.append(rec)
+        return records
+
+    def get_collection_debug_records(self, collection_id):
+        """Retrieves all candidates evaluated for a collection with provenance for audit dumping."""
+        query = """
+            SELECT ci.canonical_url, ci.post_id, ci.is_accepted, ci.matched_keywords_json,
+                   ci.rejection_reasons_json, ci.discovery_queries_json, ci.discovery_method,
+                   ci.search_url, ci.first_discovered_at, ci.last_discovered_at,
+                   pt.status, pt.author_id, pt.record_json, pt.tech_meta_json, pt.last_error
+            FROM collection_items ci
+            LEFT JOIN pipeline_tasks pt ON ci.canonical_url = pt.canonical_url
+            WHERE ci.collection_id = ?
+            ORDER BY ci.rowid ASC
+        """
+        rows = self.conn.execute(query, (collection_id,)).fetchall()
+        dataset = []
+        debug_list = []
+        for r in rows:
+            rec = None
+            if r["record_json"]:
+                try:
+                    rec = json.loads(r["record_json"])
+                except Exception:
+                    pass
+            t_meta = {}
+            if r["tech_meta_json"]:
+                try:
+                    t_meta = json.loads(r["tech_meta_json"])
+                except Exception:
+                    pass
+            if rec and r["is_accepted"]:
+                dataset.append(rec)
+
+            matched_kws = []
+            try:
+                matched_kws = json.loads(r["matched_keywords_json"] or "[]")
+            except Exception:
+                pass
+
+            reasons = []
+            try:
+                reasons = json.loads(r["rejection_reasons_json"] or "[]")
+            except Exception:
+                pass
+
+            disc_queries = []
+            try:
+                disc_queries = json.loads(r["discovery_queries_json"] or "[]")
+            except Exception:
+                pass
+
+            debug_list.append({
+                "canonical_url": r["canonical_url"],
+                "post_id": r["post_id"],
+                "author_id": r["author_id"],
+                "collection_id": collection_id,
+                "is_accepted": bool(r["is_accepted"]),
+                "status": r["status"] or "discovered",
+                "matched_keywords": matched_kws,
+                "rejection_reasons": reasons,
+                "discovery_queries": disc_queries,
+                "discovery_method": r["discovery_method"],
+                "search_url": r["search_url"],
+                "first_discovered_at": r["first_discovered_at"],
+                "last_discovered_at": r["last_discovered_at"],
+                "last_error": r["last_error"],
+                "record": rec,
+                "tech_meta": t_meta,
+            })
+        return dataset, debug_list
+
+    def get_collection_statistics(self, collection_id):
+        total_candidates = self.conn.execute(
+            "SELECT COUNT(*) FROM collection_items WHERE collection_id = ?",
+            (collection_id,),
+        ).fetchone()[0]
+        accepted_cnt = self.conn.execute(
+            "SELECT COUNT(DISTINCT post_id) FROM collection_items WHERE collection_id = ? AND is_accepted = 1",
+            (collection_id,),
+        ).fetchone()[0]
+        rejected_cnt = self.conn.execute(
+            "SELECT COUNT(DISTINCT post_id) FROM collection_items WHERE collection_id = ? AND is_accepted = 0",
+            (collection_id,),
+        ).fetchone()[0]
+        dataset_scope = f"facebook:collection:{collection_id}"
+        pending_cnt = self.get_pending_tasks_count(dataset_scope=dataset_scope)
+        return total_candidates, accepted_cnt, rejected_cnt, pending_cnt
+
     def close(self):
         try:
             self.conn.close()
@@ -644,7 +1052,7 @@ def check_facebook_access_issues(page):
     return None
 
 
-def export_dataset_bundle(db, output_dir, dataset_scope="facebook:basketball:nba", filter_sport=None):
+def export_dataset_bundle(db, output_dir, dataset_scope="facebook:basketball:nba", filter_sport=None, collection_id=None):
     """Exports dataset to unified CSV, timestamped and canonical JSON snapshots, and JSONL.
     Strictly follows 17-column order, utf-8-sig, newline='', empty cell for null.
     Returns (csv_path, accepted_count).
@@ -652,7 +1060,10 @@ def export_dataset_bundle(db, output_dir, dataset_scope="facebook:basketball:nba
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset = db.get_accepted_records(dataset_scope=dataset_scope, filter_sport=filter_sport)
+    if collection_id:
+        dataset = db.get_collection_accepted_records(collection_id)
+    else:
+        dataset = db.get_accepted_records(dataset_scope=dataset_scope, filter_sport=filter_sport)
 
     # 1. Export CSV atomically
     csv_final = out_dir / "facebook_dataset.csv"
@@ -704,7 +1115,10 @@ def export_dataset_bundle(db, output_dir, dataset_scope="facebook:basketball:nba
     jsonl_tmp.replace(jsonl_final)
 
     # 4. Save technical debug records atomically & purge older debug dumps
-    _, debug_list = db.get_all_records(dataset_scope=dataset_scope)
+    if collection_id:
+        _, debug_list = db.get_collection_debug_records(collection_id)
+    else:
+        _, debug_list = db.get_all_records(dataset_scope=dataset_scope)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
     out_debug = out_dir / f"facebook_posts_auto_debug_{stamp}.json"
     debug_tmp = out_debug.with_suffix(".json.tmp")
@@ -1710,12 +2124,502 @@ def run_pipeline(
     return 0
 
 
-def main():
+def generate_stable_collection_id(queries: list) -> str:
+    """Generates a stable, deterministic collection identifier from normalized queries."""
+    if not queries:
+        return "col_generic"
+    clean_slugs = []
+    for q in queries:
+        unacc = fd.strip_vietnamese_accents(str(q).strip().lower())
+        slug = re.sub(r"[^a-z0-9]+", "_", unacc).strip("_")
+        if slug:
+            clean_slugs.append(slug[:15])
+    combined_slug = "_".join(clean_slugs[:3])
+    h = hashlib.md5("::".join(sorted(str(q).strip().lower() for q in queries)).encode("utf-8")).hexdigest()[:8]
+    if combined_slug:
+        return f"col_{combined_slug}_{h}"
+    return f"col_{h}"
+
+
+def run_keyword_pipeline(
+    queries,
+    collection_id=None,
+    keyword_match="any",
+    exclude_keywords=None,
+    strip_accents=False,
+    limit=100,
+    limit_per_query=30,
+    max_hours=1.0,
+    poll_interval_sec=180,
+    source_max_scrolls=50,
+    idle_rounds=5,
+    fetch_followers=True,
+    headless=False,
+    output_dir=OUTPUT_DIR,
+    retry_failed=False,
+    **kwargs,
+):
+    """Executes the automated Facebook keyword discovery and batch extraction pipeline."""
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Attach file handler for pipeline.log
+    log_file = out_dir / "pipeline.log"
+    file_handler = logging.FileHandler(str(log_file), encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", "%H:%M:%S"))
+    logger.addHandler(file_handler)
+
+    # Acquire single-process lock
+    lock = PipelineLock(out_dir)
+    try:
+        lock.acquire()
+    except RuntimeError as lock_err:
+        logger.error(str(lock_err))
+        return 1
+
+    clean_queries = list(dict.fromkeys(str(q).strip() for q in queries if q and str(q).strip()))
+    if not clean_queries:
+        logger.error("No valid queries provided for keyword pipeline.")
+        lock.release()
+        return 1
+
+    col_id = collection_id.strip() if collection_id else generate_stable_collection_id(clean_queries)
+    db = PipelineDB(out_dir / "facebook_pipeline.sqlite")
+
+    db.register_collection(
+        collection_id=col_id,
+        queries=clean_queries,
+        exclude_keywords=exclude_keywords,
+        keyword_match=keyword_match,
+        strip_accents=strip_accents,
+        limit_accepted=limit,
+    )
+
+    collection_config = {
+        "queries": clean_queries,
+        "exclude_keywords": exclude_keywords or [],
+        "keyword_match": keyword_match,
+        "strip_accents": strip_accents,
+    }
+
+    dataset_scope = f"facebook:collection:{col_id}"
+    run_id = f"run_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ')}"
+
+    # Recover any crashed tasks
+    db.recover_interrupted_tasks(dataset_scope=dataset_scope)
+
+    start_mono = time.monotonic()
+    deadline_mono = (start_mono + max_hours * 3600.0) if (max_hours and max_hours > 0) else None
+
+    interrupted = False
+
+    def handle_signal(sig, frame):
+        nonlocal interrupted
+        logger.info("\nSignal received (Ctrl+C / SIGTERM). Gracefully pausing pipeline and committing state...")
+        interrupted = True
+
+    prev_sigint = signal.signal(signal.SIGINT, handle_signal)
+    prev_sigterm = signal.signal(signal.SIGTERM, handle_signal)
+
+    def is_deadline_reached():
+        return interrupted or (deadline_mono is not None and time.monotonic() >= deadline_mono)
+
+    def interruptible_sleep(seconds, step=0.3):
+        target = time.monotonic() + seconds
+        while time.monotonic() < target:
+            if is_deadline_reached():
+                break
+            time.sleep(min(step, target - time.monotonic()))
+
+    counters = {
+        "discovered_candidates": 0,
+        "newly_enqueued": 0,
+        "reused_from_cache": 0,
+        "attempted": 0,
+        "accepted": 0,
+        "rejected_keyword": 0,
+        "rejected_exclude": 0,
+        "rejected_quality": 0,
+        "unavailable": 0,
+        "failed": 0,
+        "browser_recoveries": 0,
+    }
+
+    # Seed accepted count with whatever is already accepted for this collection in SQLite
+    existing_acc = len(db.get_collection_accepted_records(col_id))
+    counters["accepted"] = existing_acc
+
+    time_breakdown = {
+        "discovery": 0.0,
+        "extraction": 0.0,
+        "followers": 0.0,
+        "export": 0.0,
+    }
+
+    logger.info("=" * 60)
+    logger.info("FACEBOOK KEYWORD PIPELINE STARTED")
+    logger.info(f"Collection ID: {col_id}")
+    logger.info(f"Queries ({len(clean_queries)}): {clean_queries}")
+    logger.info(f"Match mode: {keyword_match} | Strip accents: {strip_accents}")
+    if exclude_keywords:
+        logger.info(f"Exclude keywords: {exclude_keywords}")
+    logger.info(f"Target accepted: {limit or 'unlimited'} | Limit per query: {limit_per_query} | Max hours: {max_hours}")
+    logger.info(f"Output directory: {out_dir}")
+    logger.info("=" * 60)
+
+    stop_early_reason = None
+    last_export_mono = time.monotonic()
+
+    def process_extraction_batch(context, extraction_page, limit_batch):
+        nonlocal stop_early_reason, last_export_mono
+        tasks = db.get_pending_tasks(limit=limit_batch, dataset_scope=dataset_scope, retry_failed=retry_failed)
+        if not tasks:
+            return 0
+
+        followers_cache = {}
+        processed = 0
+
+        for idx, task in enumerate(tasks, start=1):
+            if is_deadline_reached():
+                stop_early_reason = "max_hours_deadline_reached" if not interrupted else "user_interrupted"
+                break
+
+            if limit and counters["accepted"] >= limit:
+                stop_early_reason = "target_limit_reached"
+                break
+
+            raw_url = task["input_url"]
+            counters["attempted"] += 1
+            processed += 1
+            logger.info(f"\n[Task {counters['attempted']}] Extracting: {raw_url}")
+            db.update_task_processing(raw_url)
+
+            t_ext_start = time.monotonic()
+            try:
+                remaining_s = (deadline_mono - time.monotonic()) if deadline_mono else 30.0
+                nav_timeout = max(5000, min(30000, int(remaining_s * 1000)))
+
+                extraction_page.goto(raw_url, wait_until="domcontentloaded", timeout=nav_timeout)
+                interruptible_sleep(3.0)
+
+                access_issue_str = check_facebook_access_issues(extraction_page)
+                if access_issue_str:
+                    stop_early_reason = "login_or_checkpoint_required"
+                    db.record_failure(raw_url, access_issue_str, status="failed", canonical_url=extraction_page.url, run_id=run_id, dataset_scope=dataset_scope)
+                    logger.warning(f"Facebook authentication checkpoint detected: {access_issue_str}")
+                    break
+
+                record, meta = fd.extract_scoped_post_data(
+                    extraction_page,
+                    post_url=raw_url,
+                    default_sport=None,
+                    allow_video_caption=True,
+                )
+
+                if meta.get("status") == "unavailable":
+                    counters["unavailable"] += 1
+                    db.record_failure(raw_url, "Post unavailable or deleted", status="unavailable", canonical_url=extraction_page.url, run_id=run_id, dataset_scope=dataset_scope)
+                    logger.info("  -> Status: unavailable (deleted or restricted)")
+                    continue
+
+                if fetch_followers and record.get("author_id"):
+                    author = record["author_id"]
+                    cached_fol = db.get_followers_cache(author)
+                    if cached_fol:
+                        record["author_followers"] = cached_fol["followers"]
+                    else:
+                        t_fol_start = time.monotonic()
+                        f_val = fd.fetch_author_followers(context, author, cache=followers_cache)
+                        time_breakdown["followers"] += (time.monotonic() - t_fol_start)
+                        if f_val is not None:
+                            db.set_followers_cache(author, f_val, source="profile")
+                            record["author_followers"] = f_val
+
+                is_acc, matched_kws, reasons = db.record_keyword_success(
+                    input_url=raw_url,
+                    canonical_url=record["post_url"],
+                    post_id=record["post_id"],
+                    author_id=record["author_id"],
+                    record_17_col=record,
+                    tech_meta=meta,
+                    collection_id=col_id,
+                    collection_config=collection_config,
+                    run_id=run_id,
+                )
+
+                if is_acc:
+                    counters["accepted"] += 1
+                    logger.info(f"  -> [ACCEPTED KEYWORD POST] ID: {record['post_id']} | Matched: {matched_kws} | Text: {record['text'][:60]}...")
+                else:
+                    if any("excluded_keyword" in r for r in reasons):
+                        counters["rejected_exclude"] += 1
+                        logger.info(f"  -> [REJECTED] Excluded keyword matched: {reasons}")
+                    elif any("keyword" in r for r in reasons):
+                        counters["rejected_keyword"] += 1
+                        logger.info(f"  -> [REJECTED] Keyword not matched in caption: {reasons}")
+                    else:
+                        counters["rejected_quality"] += 1
+                        logger.info(f"  -> [REJECTED] Quality check failed: {reasons}")
+
+            except (Error, Exception) as exc:
+                counters["failed"] += 1
+                logger.error(f"  -> Extraction failed for {raw_url}: {exc}")
+                db.record_failure(raw_url, str(exc), status="failed", canonical_url=extraction_page.url if extraction_page else None, run_id=run_id, dataset_scope=dataset_scope)
+
+            finally:
+                time_breakdown["extraction"] += (time.monotonic() - t_ext_start)
+
+            # Periodic exports every 60s
+            if time.monotonic() - last_export_mono >= 60.0:
+                last_export_mono = time.monotonic()
+                t_exp = time.monotonic()
+                export_dataset_bundle(db, out_dir, collection_id=col_id)
+                time_breakdown["export"] += (time.monotonic() - t_exp)
+
+        return processed
+
+    # Main browser session loop
+    try:
+        with fd.PersistentBrowserSession(PROFILE_DIR, fingerprint=FINGERPRINT_SEED, headless=headless) as context:
+            extraction_page = context.new_page()
+
+            round_idx = 0
+            while not is_deadline_reached() and not stop_early_reason:
+                if limit and counters["accepted"] >= limit:
+                    stop_early_reason = "target_limit_reached"
+                    break
+
+                round_idx += 1
+                logger.info(f"\n--- Starting Discovery Round {round_idx} ---")
+                round_new_candidates = 0
+
+                for q_idx, query_str in enumerate(clean_queries, start=1):
+                    if is_deadline_reached() or stop_early_reason:
+                        break
+                    if limit and counters["accepted"] >= limit:
+                        stop_early_reason = "target_limit_reached"
+                        break
+
+                    logger.info(f"\n[Query {q_idx}/{len(clean_queries)}] Searching Facebook for: '{query_str}'")
+
+                    disc_session = disc.FacebookSearchDiscoverySession(
+                        query=query_str,
+                        context=context,
+                        limit_per_query=limit_per_query,
+                        max_scrolls=source_max_scrolls,
+                        idle_rounds=idle_rounds,
+                        deadline_mono=deadline_mono,
+                        existing_seen_keys=db.get_all_seen_keys(),
+                    )
+
+                    t_disc = time.monotonic()
+                    try:
+                        disc_session.start()
+
+                        def on_candidate(item):
+                            nonlocal round_new_candidates
+                            counters["discovered_candidates"] += 1
+                            is_new, reused, cached_post = db.enqueue_keyword_candidate(
+                                candidate=item,
+                                collection_id=col_id,
+                                collection_config=collection_config,
+                                run_id=run_id,
+                            )
+                            if is_new:
+                                counters["newly_enqueued"] += 1
+                                round_new_candidates += 1
+                            if reused:
+                                counters["reused_from_cache"] += 1
+                                if db.is_collection_item_accepted(col_id, item["canonical_url"]):
+                                    counters["accepted"] += 1
+                                    logger.info(f"  -> [REUSED FROM DB] ID: {item['post_id']} accepted for collection")
+                            return is_new
+
+                        disc_session.discover_batch(
+                            batch_size=limit_per_query,
+                            on_candidate_discovered=on_candidate,
+                            deadline_mono=deadline_mono,
+                        )
+                    except Exception as exc:
+                        logger.error(f"Error in search discovery for query '{query_str}': {exc}")
+                        if "login" in str(exc).lower() or "checkpoint" in str(exc).lower():
+                            stop_early_reason = "login_or_checkpoint_required"
+                            break
+                    finally:
+                        time_breakdown["discovery"] += (time.monotonic() - t_disc)
+                        disc_session.close()
+
+                    # Process extraction batch for pending tasks
+                    process_extraction_batch(context, extraction_page, limit_batch=limit_per_query)
+
+                    if limit and counters["accepted"] >= limit:
+                        stop_early_reason = "target_limit_reached"
+                        break
+
+                # Check polling condition
+                if not is_deadline_reached() and not stop_early_reason:
+                    if poll_interval_sec and poll_interval_sec > 0:
+                        logger.info(f"\nSleeping {poll_interval_sec}s before next polling cycle...")
+                        t_exp = time.monotonic()
+                        export_dataset_bundle(db, out_dir, collection_id=col_id)
+                        time_breakdown["export"] += (time.monotonic() - t_exp)
+                        interruptible_sleep(poll_interval_sec)
+                    else:
+                        break
+
+            # Finish any pending tasks
+            while not is_deadline_reached() and not stop_early_reason and (not limit or counters["accepted"] < limit):
+                proc = process_extraction_batch(context, extraction_page, limit_batch=limit_per_query)
+                if proc == 0:
+                    break
+
+            try:
+                extraction_page.close()
+            except Exception:
+                pass
+
+    except Exception as exc:
+        logger.error(f"Browser session terminated: {exc}")
+        if stop_early_reason is None:
+            stop_early_reason = f"session_error: {exc}"
+
+    finally:
+        lock.release()
+        signal.signal(signal.SIGINT, prev_sigint)
+        signal.signal(signal.SIGTERM, prev_sigterm)
+
+    elapsed_total = time.monotonic() - start_mono
+    if interrupted:
+        stop_early_reason = "user_interrupted"
+    elif is_deadline_reached() and not stop_early_reason:
+        stop_early_reason = "max_hours_deadline_reached"
+    elif not stop_early_reason:
+        stop_early_reason = "all_queries_and_tasks_completed"
+
+    # Final exports
+    t_exp = time.monotonic()
+    export_dataset_bundle(db, out_dir, collection_id=col_id)
+    time_breakdown["export"] += (time.monotonic() - t_exp)
+
+    total_cands, acc_in_db, rej_in_db, pending_in_db = db.get_collection_statistics(col_id)
+    rate_per_hour = (counters["accepted"] / (elapsed_total / 3600.0)) if elapsed_total > 0 else 0.0
+
+    summary_data = {
+        "run_id": run_id,
+        "collection_id": col_id,
+        "mode": "keyword",
+        "queries": clean_queries,
+        "keyword_match": keyword_match,
+        "exclude_keywords": exclude_keywords or [],
+        "strip_accents": strip_accents,
+        "started_at": datetime.fromtimestamp(time.time() - elapsed_total, tz=timezone.utc).isoformat(),
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "elapsed_seconds": round(elapsed_total, 1),
+        "time_budget_hours": max_hours,
+        "stop_reason": stop_early_reason,
+        "tasks_summary": {
+            "discovered_candidates": counters["discovered_candidates"],
+            "newly_enqueued": counters["newly_enqueued"],
+            "reused_from_cache": counters["reused_from_cache"],
+            "attempted_extractions": counters["attempted"],
+            "accepted_this_run": counters["accepted"],
+            "total_accepted_in_collection": acc_in_db,
+            "rejected_keyword_mismatch": counters["rejected_keyword"],
+            "rejected_excluded_keyword": counters["rejected_exclude"],
+            "rejected_quality_reasons": counters["rejected_quality"],
+            "unavailable_or_deleted": counters["unavailable"],
+            "failed_after_retries": counters["failed"],
+            "pending_in_queue": pending_in_db,
+        },
+        "performance": {
+            "accepted_posts_per_hour": round(rate_per_hour, 2),
+            "total_elapsed_minutes": round(elapsed_total / 60.0, 2),
+            "time_breakdown_seconds": {k: round(v, 1) for k, v in time_breakdown.items()},
+        },
+    }
+
+    write_run_summary(out_dir, summary_data)
+    write_progress(out_dir, {
+        "run_id": run_id,
+        "collection_id": col_id,
+        "status": "completed",
+        "elapsed_seconds": round(elapsed_total, 1),
+        "accepted": acc_in_db,
+        "stop_reason": stop_early_reason,
+    })
+
+    print("\n" + "=" * 60)
+    print(f"FACEBOOK KEYWORD COLLECTION SUMMARY [{col_id}]")
+    print("=" * 60)
+    print(f"Stop reason: {stop_early_reason}")
+    print(f"Elapsed: {elapsed_total:.1f}s ({elapsed_total/60:.1f} min)")
+    print(f"Candidates discovered: {counters['discovered_candidates']} (New: {counters['newly_enqueued']}, Reused: {counters['reused_from_cache']})")
+    print(f"Extractions attempted: {counters['attempted']}")
+    print(f"Accepted in collection: {acc_in_db}")
+    print(f"Rejected: Keyword mismatch: {counters['rejected_keyword']} | Excluded keyword: {counters['rejected_exclude']} | Quality: {counters['rejected_quality']}")
+    print(f"Output files saved to: {out_dir}")
+    print("=" * 60 + "\n")
+
+    db.close()
+
+    if stop_early_reason == "login_or_checkpoint_required":
+        print("\n[ALERT] Facebook authentication wall or checkpoint detected. Saved state safely.")
+        print("Please run python cloak_facebook_login.py manually to re-authenticate.\n")
+        return 2
+
+    return 0
+
+
+def parse_queries(queries_str: str = None, queries_file: str = None) -> list:
+    """Parses, trims, and deduplicates queries from string and/or UTF-8 file.
+
+    Supports:
+    - Comma-separated query strings.
+    - Text file with one query per line, ignoring empty lines and comments (#).
+    - Quotes in lines (e.g. "phrase, with comma").
+    """
+    import csv
+    raw_queries = []
+    if queries_str:
+        try:
+            reader = csv.reader([queries_str], skipinitialspace=True)
+            for row in reader:
+                raw_queries.extend([q.strip() for q in row if q.strip()])
+        except Exception:
+            raw_queries.extend([q.strip() for q in queries_str.split(",") if q.strip()])
+
+    if queries_file:
+        q_path = Path(queries_file)
+        if q_path.is_file():
+            content = q_path.read_text(encoding="utf-8-sig")
+            for line in content.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if (line.startswith('"') and line.endswith('"')) or (line.startswith("'") and line.endswith("'")):
+                    line = line[1:-1].strip()
+                if line:
+                    raw_queries.append(line)
+
+    return list(dict.fromkeys(raw_queries))
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Constructs command line argument parser for facebook_pipeline."""
     parser = argparse.ArgumentParser(
-        description="Facebook Automated NBA Scraper Pipeline (Continuous Discovery & Extraction)",
+        description="Facebook Automated Scraper Pipeline (Continuous Discovery & Extraction)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--mode", type=str, default="permalink", help=argparse.SUPPRESS)
+    parser.add_argument("--mode", type=str, choices=["permalink", "keyword", "feed"], default="permalink", help="Pipeline execution mode: 'permalink' (Page/URL source discovery) or 'keyword' (Facebook Post Search discovery)")
+    parser.add_argument("--queries", type=str, default=None, help="Comma-separated query phrases for keyword search")
+    parser.add_argument("--queries-file", type=str, default=None, help="UTF-8 text file containing queries, one per line (supports phrases with commas)")
+    parser.add_argument("--collection-id", type=str, default=None, help="Collection identifier (defaults to stable deterministic ID from queries)")
+    parser.add_argument("--keyword-match", type=str, choices=["any", "all"], default="any", help="Keyword matching policy on caption: 'any' (default) or 'all'")
+    parser.add_argument("--exclude-keywords", type=str, default=None, help="Comma-separated exclusion phrases")
+    parser.add_argument("--strip-accents", action="store_true", help="Enable unaccented matching (e.g. 'xe dien' matches 'xe điện')")
+    parser.add_argument("--limit-per-query", type=int, default=30, help="Max candidates per query in a discovery round (default: 30)")
+    parser.add_argument("--poll-interval-sec", type=int, default=180, help="Interval in seconds between discovery polling cycles in keyword mode (default: 180)")
+
     parser.add_argument("--urls", type=str, help="Path to input URL file (.txt, .jsonl, .csv)")
     parser.add_argument("--page", type=str, help="Single Facebook Page URL to discover posts from")
     parser.add_argument("--pages", "--sources", dest="pages", type=str, help="UTF-8 text file containing Page URLs, one per line")
@@ -1726,7 +2630,7 @@ def main():
     parser.add_argument("--max-hours", type=float, default=1.0, help="Maximum execution time in hours (default: 1.0 for 60-min pilot)")
     parser.add_argument("--target-valid", type=int, default=None, help="Target valid accepted NBA posts to stop early (default: None)")
     parser.add_argument("--max-attempts", type=int, default=None, help="Hard cap on tasks attempted in this run (default: None)")
-    parser.add_argument("--limit", type=int, default=None, help="Deprecated alias for --max-attempts")
+    parser.add_argument("--limit", type=int, default=None, help="Max accepted posts in keyword mode, or alias for --max-attempts in permalink mode")
     parser.add_argument("--max-new-urls", type=int, default=None, help="Cap on new URLs enqueued in this run (default: None)")
     parser.add_argument("--source-max-scrolls", "--max-scrolls", dest="source_max_scrolls", type=int, default=100, help="Max scan/scroll rounds per source page (default: 100)")
     parser.add_argument("--max-refreshes", type=int, default=0, help="Max reload attempts when scrolling stalls; 0 disables (default: 0)")
@@ -1747,8 +2651,53 @@ def main():
 
     # Sport deprecated argument
     parser.add_argument("--sport", type=str, default=None, help=argparse.SUPPRESS)
+    return parser
 
+
+def validate_args(args):
+    """Validates command-line arguments and raises ValueError if invalid."""
+    if args.mode == "keyword":
+        clean_queries = parse_queries(args.queries, args.queries_file)
+        if not clean_queries:
+            raise ValueError("Please provide --queries or --queries-file with at least one non-empty query for --mode keyword.")
+        if args.limit_per_query is not None and args.limit_per_query <= 0:
+            raise ValueError("--limit-per-query must be a positive integer greater than 0.")
+        if args.poll_interval_sec is not None and args.poll_interval_sec < 0:
+            raise ValueError("--poll-interval-sec must be 0 or greater.")
+        if args.max_hours is not None and args.max_hours <= 0:
+            raise ValueError("--max-hours must be a positive number greater than 0.")
+        if args.limit is not None and args.limit <= 0:
+            raise ValueError("--limit must be a positive integer greater than 0.")
+        return
+
+    # Standard permalink/feed mode
+    if args.max_hours is not None and args.max_hours <= 0:
+        raise ValueError("--max-hours must be a positive number greater than 0.")
+    if hasattr(args, "batch_size") and args.batch_size is not None and args.batch_size <= 0:
+        raise ValueError("--batch-size must be a positive integer greater than 0.")
+    if hasattr(args, "source_max_scrolls") and args.source_max_scrolls is not None and args.source_max_scrolls <= 0:
+        raise ValueError("--source-max-scrolls must be a positive integer greater than 0.")
+    if hasattr(args, "idle_rounds") and args.idle_rounds is not None and args.idle_rounds <= 0:
+        raise ValueError("--idle-rounds must be a positive integer greater than 0.")
+    if hasattr(args, "max_refreshes") and args.max_refreshes is not None and args.max_refreshes < 0:
+        raise ValueError("--max-refreshes must be 0 or greater.")
+    if hasattr(args, "target_valid") and args.target_valid is not None and args.target_valid <= 0:
+        raise ValueError("--target-valid must be a positive integer greater than 0.")
+
+    if not getattr(args, "reprocess_offline", False):
+        sqlite_exists = (Path(args.output_dir) / "facebook_pipeline.sqlite").exists() if args.output_dir else False
+        if not args.urls and not args.page and not args.pages and not sqlite_exists:
+            raise ValueError("Missing target Facebook page or input URLs for permalink mode. Please provide --urls <file>, --page <url>, or --pages <file>.")
+
+
+def main():
+    parser = build_arg_parser()
     args = parser.parse_args()
+
+    try:
+        validate_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # Offline reprocess execution branch
     if args.reprocess_offline:
@@ -1766,21 +2715,30 @@ def main():
         )
         return 0
 
-    # Validate numeric parameters
-    if args.max_hours is not None and args.max_hours <= 0:
-        parser.error("--max-hours must be a positive number greater than 0.")
-    if args.batch_size <= 0:
-        parser.error("--batch-size must be a positive integer greater than 0.")
-    if args.source_max_scrolls <= 0:
-        parser.error("--source-max-scrolls must be a positive integer greater than 0.")
-    if args.idle_rounds <= 0:
-        parser.error("--idle-rounds must be a positive integer greater than 0.")
-    if args.max_refreshes < 0:
-        parser.error("--max-refreshes must be 0 or greater.")
-    if args.target_valid is not None and args.target_valid <= 0:
-        parser.error("--target-valid must be a positive integer greater than 0.")
+    # Keyword Mode Execution Branch
+    if args.mode == "keyword":
+        clean_queries = parse_queries(args.queries, args.queries_file)
+        exclude_kws = [k.strip() for k in args.exclude_keywords.split(",") if k.strip()] if args.exclude_keywords else []
 
-    # Handle deprecated --limit alias
+        return run_keyword_pipeline(
+            queries=clean_queries,
+            collection_id=args.collection_id,
+            keyword_match=args.keyword_match,
+            exclude_keywords=exclude_kws,
+            strip_accents=args.strip_accents,
+            limit=args.limit or args.target_valid,
+            limit_per_query=args.limit_per_query,
+            max_hours=args.max_hours,
+            poll_interval_sec=args.poll_interval_sec,
+            source_max_scrolls=args.source_max_scrolls,
+            idle_rounds=args.idle_rounds,
+            fetch_followers=not args.no_followers,
+            headless=args.headless,
+            output_dir=args.output_dir,
+            retry_failed=args.retry_failed,
+        )
+
+    # Standard permalink mode
     max_attempts = args.max_attempts
     if args.limit is not None:
         logger.warning("Flag --limit is deprecated as a row limit; treated as alias for --max-attempts.")
@@ -1788,11 +2746,9 @@ def main():
             parser.error("Conflicting values provided for --max-attempts and deprecated --limit.")
         max_attempts = args.limit
 
-    # Handle deprecated mode argument
     if args.mode == "feed":
         logger.warning("Feed streaming mode has been removed due to Facebook Comet DOM instability. Automatically running in robust Permalink/Discovery mode.")
 
-    # Handle deprecated --sport alias
     if args.sport is not None:
         logger.warning("Flag --sport is deprecated and treated as --sport-hint.")
         if not args.sport_hint:

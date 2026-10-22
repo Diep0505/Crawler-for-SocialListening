@@ -24,12 +24,16 @@ Does not persist cookies, passwords, full page HTML, or screenshots.
 
 import argparse
 import json
+import logging
 import os
 import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, quote_plus, urlencode, urlparse
+import facebook_dataset as fd
+
+logger = logging.getLogger("facebook_discovery")
 
 BASE_DIR = Path(__file__).resolve().parent
 FINGERPRINT_SEED = 12345
@@ -372,6 +376,269 @@ class PageDiscoverySession:
         if self.scroll_round >= self.max_scrolls:
             self.is_exhausted = True
             self.stop_reason = "max_scrolls_budget_reached"
+
+        return batch_new
+
+    def close(self):
+        if self.page is not None:
+            try:
+                self.page.close()
+            except Exception:
+                pass
+            self.page = None
+
+
+SEARCH_SCAN_JS = r"""() => {
+    const rendered = el => el.getClientRects().length > 0
+        && getComputedStyle(el).visibility !== 'hidden';
+    const main = document.querySelector('[role="main"]') || document.body;
+
+    const emptyPhrases = [
+        "we didn't find any results",
+        "không tìm thấy kết quả",
+        "no results found",
+        "không có kết quả nào",
+        "không tìm thấy bài viết nào"
+    ];
+    const mainText = (main.innerText || '').toLowerCase();
+    const hasNoResults = emptyPhrases.some(p => mainText.includes(p));
+
+    const isPostHref = (h) => {
+        if (!h) return false;
+        if (h.includes('comment_id=') || h.includes('reply_comment_id=')) return false;
+        if (h.includes('l.facebook.com') || h.includes('/hashtag/')) return false;
+        const low = h.toLowerCase();
+        return low.includes('/posts/') || low.includes('/permalink/') || low.includes('/share/p/') ||
+               low.includes('story_fbid=') || low.includes('permalink.php') ||
+               (low.includes('/photos/') && !low.endsWith('/photos/')) ||
+               (low.includes('photo.php') && low.includes('fbid=')) ||
+               (low.includes('/videos/') && !low.endsWith('/videos/')) ||
+               (low.includes('/reel/') && !low.endsWith('/reel/')) ||
+               (low.includes('/watch') && low.includes('v='));
+    };
+
+    const items = [];
+    const seen = new Set();
+
+    // 1. Articles / feed unit cards
+    const articles = Array.from(main.querySelectorAll('[role="article"], div[data-pagelet*="FeedUnit"]')).filter(rendered);
+    for (const art of articles) {
+        const anchors = Array.from(art.querySelectorAll('a[href]')).filter(rendered);
+        let bestHref = null;
+        let bestLabel = '';
+        for (const a of anchors) {
+            const h = a.href || '';
+            if (isPostHref(h)) {
+                const aria = (a.getAttribute('aria-label') || '').trim();
+                const text = (a.innerText || '').trim();
+                bestHref = h;
+                bestLabel = aria || text;
+                if (aria && /\d/.test(aria)) break;
+                if (h.includes('/posts/') || h.includes('/permalink/') || h.includes('story_fbid=')) break;
+            }
+        }
+        if (bestHref && !seen.has(bestHref)) {
+            seen.add(bestHref);
+            const msgEl = art.querySelector('div[data-ad-preview="message"], div[data-ad-comet-preview="message"], div[dir="auto"]');
+            const preview = msgEl ? (msgEl.innerText || '').trim().slice(0, 2000) : '';
+            items.push({
+                href: bestHref,
+                label: bestLabel.slice(0, 250),
+                preview: preview,
+                in_article: true
+            });
+        }
+    }
+
+    // 2. Extra anchors in main
+    const allAnchors = Array.from(main.querySelectorAll('a[href]')).filter(rendered);
+    for (const a of allAnchors) {
+        const h = a.href || '';
+        if (isPostHref(h) && !seen.has(h)) {
+            seen.add(h);
+            const card = a.closest('[role="article"]') || a.closest('div[data-pagelet*="FeedUnit"]');
+            const preview = card ? (card.innerText || '').slice(0, 2000) : '';
+            items.push({
+                href: h,
+                label: (a.innerText || a.getAttribute('aria-label') || '').slice(0, 250),
+                preview: preview,
+                in_article: Boolean(card)
+            });
+        }
+    }
+
+    return {
+        has_no_results: hasNoResults,
+        card_count: articles.length,
+        item_count: items.length,
+        items: items
+    };
+}"""
+
+
+def build_facebook_search_url(query: str) -> str:
+    """Builds a standardized Facebook Post Search URL with proper URL encoding."""
+    return f"https://www.facebook.com/search/posts/?q={quote_plus(str(query).strip())}"
+
+
+class FacebookSearchDiscoverySession:
+    """Manages an active Facebook Post Search tab for a specific keyword query.
+
+    Navigates to https://www.facebook.com/search/posts/?q=...
+    Scans results, isolates post cards, extracts real permalinks,
+    and supports scrolling up to limit_per_query candidates or idle exhaustion.
+    """
+    def __init__(
+        self,
+        query,
+        context,
+        limit_per_query=30,
+        max_scrolls=50,
+        idle_rounds=5,
+        deadline_mono=None,
+        existing_seen_keys=None,
+    ):
+        self.query = query.strip()
+        self.search_url = build_facebook_search_url(self.query)
+        self.context = context
+        self.limit_per_query = limit_per_query
+        self.max_scrolls = max_scrolls
+        self.idle_rounds = idle_rounds
+        self.deadline_mono = deadline_mono
+        self.seen = set(existing_seen_keys or [])
+        self.query_seen = set()
+        self.page = None
+        self.scroll_round = 0
+        self.idle = 0
+        self.is_exhausted = False
+        self.stop_reason = None
+        self.total_discovered = 0
+        self.has_no_results = False
+
+    def start(self, timeout=60000):
+        if self.page is None:
+            self.page = self.context.new_page()
+            self.page.goto(self.search_url, wait_until="domcontentloaded", timeout=timeout)
+            time.sleep(3.5)
+
+    def is_deadline_reached(self):
+        return self.deadline_mono is not None and time.monotonic() >= self.deadline_mono
+
+    def discover_batch(self, batch_size=None, on_candidate_discovered=None, deadline_mono=None):
+        if deadline_mono:
+            self.deadline_mono = deadline_mono
+
+        if self.page is None:
+            self.start()
+
+        target_batch = batch_size or self.limit_per_query
+        batch_new = []
+
+        while self.scroll_round < self.max_scrolls:
+            if self.is_deadline_reached():
+                self.stop_reason = "deadline_reached"
+                break
+
+            issue = access_issue(self.page)
+            if issue:
+                self.stop_reason = issue
+                raise ValueError(issue)
+
+            snapshot = self.page.evaluate(SEARCH_SCAN_JS)
+            if snapshot.get("has_no_results") and snapshot.get("item_count", 0) == 0:
+                self.has_no_results = True
+                self.stop_reason = "no_results_found"
+                self.is_exhausted = True
+                break
+
+            discovered_this_round = 0
+
+            for item in snapshot.get("items", []):
+                raw_href = item.get("href")
+                if not raw_href:
+                    continue
+
+                clean_url = fd.normalize_facebook_post_url(raw_href)
+                if not clean_url:
+                    continue
+
+                post_id = fd.extract_post_id(clean_url)
+                if not post_id:
+                    continue
+
+                author_id = fd.extract_author_id(clean_url)
+
+                lower_url = clean_url.lower()
+                if "/groups/" in lower_url:
+                    source_type = "group"
+                elif "profile.php" in lower_url or "/people/" in lower_url:
+                    source_type = "individual"
+                elif any(token in lower_url for token in ["/posts/", "/photos/", "/videos/"]):
+                    source_type = "fanpage"
+                else:
+                    source_type = "unknown"
+
+                key = f"facebook:post:{post_id}"
+                if key not in self.query_seen:
+                    self.query_seen.add(key)
+                    discovered_this_round += 1
+
+                candidate = {
+                    "post_url": clean_url,
+                    "canonical_url": clean_url,
+                    "post_id": post_id,
+                    "author_id": author_id,
+                    "source_type": source_type,
+                    "platform": "Facebook",
+                    "discovery_method": "keyword_search",
+                    "discovery_query": self.query,
+                    "search_url": self.search_url,
+                    "candidate_preview": item.get("preview"),
+                    "discovered_at": utc_now(),
+                    "discovery_key": key,
+                }
+
+                is_new_candidate = True
+                if on_candidate_discovered:
+                    try:
+                        res = on_candidate_discovered(candidate)
+                        if res is False:
+                            is_new_candidate = False
+                    except Exception as exc:
+                        logger.warning(f"Error in on_candidate_discovered callback: {exc}")
+
+                if key not in self.seen:
+                    self.seen.add(key)
+                    self.total_discovered += 1
+                    if is_new_candidate:
+                        batch_new.append(candidate)
+                        if len(batch_new) >= target_batch:
+                            return batch_new
+
+            self.scroll_round += 1
+
+            if discovered_this_round == 0:
+                self.idle += 1
+            else:
+                self.idle = 0
+
+            if self.idle >= self.idle_rounds:
+                self.is_exhausted = True
+                self.stop_reason = "idle_rounds_exhausted"
+                break
+
+            # Scroll down
+            self.page.mouse.wheel(0, 800)
+            target = time.monotonic() + 2.5
+            while time.monotonic() < target:
+                if self.is_deadline_reached():
+                    break
+                time.sleep(0.3)
+
+        if self.scroll_round >= self.max_scrolls:
+            self.is_exhausted = True
+            if not self.stop_reason:
+                self.stop_reason = "max_scrolls_budget_reached"
 
         return batch_new
 

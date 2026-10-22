@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import re
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -1250,9 +1251,101 @@ def classify_nba_post(text, sport_hint=None, author_or_source=None, policy="cont
     }
 
 
-def evaluate_record_acceptance(record, tech_meta=None, target_sport="Basketball", target_competition="NBA"):
-    """Evaluates whether a dataset record meets all strict quality criteria for inclusion
-    in the final research dataset.
+def strip_vietnamese_accents(text: str) -> str:
+    """Strips Vietnamese diacritical marks while preserving base characters."""
+    if not text:
+        return ""
+    text = text.replace("đ", "d").replace("Đ", "D")
+    nfd = unicodedata.normalize("NFD", text)
+    return "".join(c for c in nfd if unicodedata.category(c) != "Mn")
+
+
+def _keyword_to_regex(keyword: str, strip_accents_flag: bool = False) -> re.Pattern:
+    clean = keyword.strip()
+    if strip_accents_flag:
+        clean = strip_vietnamese_accents(clean)
+    else:
+        clean = unicodedata.normalize("NFC", clean)
+    clean = clean.lower()
+    # Boundary (?<!\w) allows start of text, whitespace, punctuation, or '#'
+    # Boundary (?!\w) allows end of text, whitespace, punctuation
+    pattern = rf"(?<!\w){re.escape(clean)}(?!\w)"
+    return re.compile(pattern, re.IGNORECASE)
+
+
+def match_keywords(
+    text: str,
+    include_keywords: list,
+    exclude_keywords: list = None,
+    match_mode: str = "any",
+    strip_accents: bool = False,
+):
+    """Evaluates whether text matches configured keyword criteria.
+
+    Principles:
+    - Unicode normalization (NFC) and case-insensitive.
+    - Word boundary rules prevent substring false positives (e.g. 'AI' in 'Thailand' does not match).
+    - Hashtags like '#AI' or '#xe_dien' match cleanly.
+    - match_mode 'any' requires at least one include keyword to match.
+    - match_mode 'all' requires all include keywords to match.
+    - Any matching exclude_keyword causes rejection.
+
+    Returns:
+        (is_accepted: bool, matched_keywords: list[str], rejection_reasons: list[str])
+    """
+    if not text or not str(text).strip():
+        return False, [], ["missing_caption_text"]
+
+    norm_text = strip_vietnamese_accents(text) if strip_accents else unicodedata.normalize("NFC", text)
+    norm_text_lower = norm_text.lower()
+
+    # 1. Check exclude keywords
+    matched_excludes = []
+    if exclude_keywords:
+        for exc in exclude_keywords:
+            if not exc or not str(exc).strip():
+                continue
+            pat = _keyword_to_regex(str(exc), strip_accents_flag=strip_accents)
+            if pat.search(norm_text_lower):
+                matched_excludes.append(str(exc).strip())
+
+    if matched_excludes:
+        return False, [], [f"excluded_keyword_matched: {', '.join(matched_excludes)}"]
+
+    # 2. Check include keywords
+    clean_includes = [str(k).strip() for k in (include_keywords or []) if str(k).strip()]
+    if not clean_includes:
+        return True, [], []
+
+    matched_includes = []
+    for inc in clean_includes:
+        pat = _keyword_to_regex(inc, strip_accents_flag=strip_accents)
+        if pat.search(norm_text_lower):
+            matched_includes.append(inc)
+
+    if match_mode.lower() == "all":
+        if len(matched_includes) == len(clean_includes):
+            return True, matched_includes, []
+        else:
+            missing = [k for k in clean_includes if k not in matched_includes]
+            return False, matched_includes, [f"missing_required_keywords: {', '.join(missing)}"]
+    else:  # "any"
+        if len(matched_includes) > 0:
+            return True, matched_includes, []
+        else:
+            return False, [], ["keyword_not_matched"]
+
+
+def evaluate_record_acceptance(
+    record,
+    tech_meta=None,
+    target_sport="Basketball",
+    target_competition="NBA",
+    allow_video=False,
+    require_like_count=True,
+):
+    """Evaluates whether a dataset record meets quality criteria for inclusion
+    in the research dataset.
 
     Returns:
         (is_accepted: bool, rejection_reasons: list[str])
@@ -1262,7 +1355,7 @@ def evaluate_record_acceptance(record, tech_meta=None, target_sport="Basketball"
         reasons.append("missing_post_id")
     if not record.get("post_url"):
         reasons.append("missing_post_url")
-    if record.get("media_type") == "video":
+    if record.get("media_type") == "video" and not allow_video:
         reasons.append("video_post_omitted_by_policy")
     if not record.get("text") or not str(record.get("text")).strip():
         reasons.append("missing_caption_text")
@@ -1297,8 +1390,12 @@ def evaluate_record_acceptance(record, tech_meta=None, target_sport="Basketball"
             reasons.append(f"sport_category_mismatch (got '{sport}', expected '{target_sport}')")
 
     like_count = record.get("like_count")
-    if like_count is None or not isinstance(like_count, int) or like_count < 0:
-        reasons.append("missing_or_invalid_like_count")
+    if require_like_count:
+        if like_count is None or not isinstance(like_count, int) or like_count < 0:
+            reasons.append("missing_or_invalid_like_count")
+    else:
+        if like_count is not None and (not isinstance(like_count, int) or like_count < 0):
+            reasons.append("invalid_like_count")
 
     is_accepted = (len(reasons) == 0)
     return is_accepted, reasons
@@ -1417,36 +1514,47 @@ def normalize_facebook_post_url(url):
         if not parsed.netloc:
             return url.strip()
 
+        netloc = parsed.netloc.lower()
+        if netloc in ("m.facebook.com", "mobile.facebook.com", "web.facebook.com"):
+            netloc = "www.facebook.com"
+
         path = parsed.path.rstrip("/")
-        if any(p in path for p in ("/posts/", "/share/p/", "/videos/", "/reel/", "/photos/")):
-            return f"{parsed.scheme}://{parsed.netloc}{path}/"
+        if netloc in ("l.facebook.com", "lm.facebook.com") or path.endswith(("/l.php", "/ad_break")):
+            return ""
+
+        if any(p in path for p in ("/posts/", "/permalink/", "/share/p/", "/videos/", "/reel/", "/photos/")):
+            return f"{parsed.scheme}://{netloc}{path}/"
 
         if "/watch" in path:
             query = parse_qs(parsed.query)
             if "v" in query and query["v"]:
-                return f"{parsed.scheme}://{parsed.netloc}{path}?v={query['v'][0]}"
+                return f"{parsed.scheme}://{netloc}{path}?v={query['v'][0]}"
 
         if "photo" in path:
             query = parse_qs(parsed.query)
             if "fbid" in query and query["fbid"]:
-                return f"{parsed.scheme}://{parsed.netloc}{path}?fbid={query['fbid'][0]}"
+                return f"{parsed.scheme}://{netloc}{path}?fbid={query['fbid'][0]}"
 
-        if path.endswith(("/permalink.php", "/story.php")):
+        if path.endswith(("/permalink.php", "/story.php", "/profile.php")):
             query = parse_qs(parsed.query)
-            keep_params = {}
-            for k in ("story_fbid", "fbid", "id"):
-                if k in query and query[k]:
-                    keep_params[k] = query[k][0]
-            if keep_params:
-                from urllib.parse import urlencode
-                return f"{parsed.scheme}://{parsed.netloc}{path}?" + urlencode(sorted(keep_params.items()))
+            if "story_fbid" in query or "fbid" in query:
+                keep_params = {}
+                for k in ("story_fbid", "fbid", "id"):
+                    if k in query and query[k]:
+                        keep_params[k] = query[k][0]
+                if keep_params:
+                    from urllib.parse import urlencode
+                    return f"{parsed.scheme}://{netloc}{path}?" + urlencode(sorted(keep_params.items()))
 
         query = parse_qs(parsed.query)
-        tracking_keys = {"fbclid", "ref", "__cft__", "__tn__", "source", "paipv", "locale", "comment_id"}
+        tracking_keys = {
+            "fbclid", "ref", "__cft__", "__tn__", "source", "paipv", "locale",
+            "comment_id", "reply_comment_id", "notif_id", "notif_t", "extid"
+        }
         filtered_query = {k: v[0] for k, v in query.items() if k.lower() not in tracking_keys and v}
         from urllib.parse import urlencode
         q_str = ("?" + urlencode(sorted(filtered_query.items()))) if filtered_query else ""
-        return f"{parsed.scheme}://{parsed.netloc}{path}{q_str}"
+        return f"{parsed.scheme}://{netloc}{path}{q_str}"
     except Exception:
         return url.strip()
 
@@ -1475,9 +1583,18 @@ def extract_post_id(url):
         parsed = urlparse(url)
         path = parsed.path.rstrip("/")
 
+        # Check group post / permalink format first
+        group_match = re.search(r"/groups/[^/?#]+/(?:posts|permalink)/([^/?#]+)", path)
+        if group_match:
+            return group_match.group(1)
+
         post_match = re.search(r"/posts/([^/?#]+)", path)
         if post_match:
             return post_match.group(1)
+
+        permalink_match = re.search(r"/permalink/([^/?#]+)", path)
+        if permalink_match:
+            return permalink_match.group(1)
 
         share_match = re.search(r"/share/p/([^/?#]+)", path)
         if share_match:
@@ -1698,6 +1815,7 @@ def build_dataset_record(
     hashtags=None,
     mentions=None,
     platform="Facebook",
+    allow_video_caption=False,
 ):
     """Builds a standardized 17-column dataset record with exact schema compliance."""
     final_post_id = post_id or extract_post_id(post_url)
@@ -1715,8 +1833,8 @@ def build_dataset_record(
 
     final_media_type = media_type or "text"
 
-    # For Facebook video posts, omit caption text, language, hashtags, mentions, and sport due to video player DOM quirks
-    if final_media_type == "video" and str(platform or "Facebook").lower() == "facebook":
+    # For Facebook video posts, omit caption text only when allow_video_caption is False (NBA policy)
+    if final_media_type == "video" and str(platform or "Facebook").lower() == "facebook" and not allow_video_caption:
         final_text = None
         final_language = None
         final_hashtags = []
@@ -2361,6 +2479,7 @@ def extract_scoped_post_data(
     reference_tz=VIETNAM_TZ,
     nba_policy="contextual",
     view_policy="verified_only",
+    allow_video_caption=False,
 ):
     """Extracts post text, metrics, published timestamp, and media scoped strictly to the post container.
     Returns:
@@ -2540,7 +2659,7 @@ def extract_scoped_post_data(
     final_author_id = (extract_author_id(page_url) if page_url else None) or extract_author_id(url)
 
     media_type = dom_res.get("media_type") or "text"
-    extracted_text = None if media_type == "video" else dom_res.get("text")
+    extracted_text = None if (media_type == "video" and not allow_video_caption) else dom_res.get("text")
 
     if extracted_text:
         extracted_text = re.sub(
@@ -2649,6 +2768,7 @@ def extract_scoped_post_data(
         share_count=share_val,
         view_count=view_val,
         media_type=dom_res.get("media_type", "text"),
+        allow_video_caption=allow_video_caption,
     )
 
     return record_17_col, tech_meta
